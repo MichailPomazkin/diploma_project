@@ -34,7 +34,6 @@ class BaseInverter(ABC):
         """
         pass
 
-    @abstractmethod
     def reconstruct(
         self,
         latent_noise: torch.Tensor,
@@ -43,18 +42,19 @@ class BaseInverter(ABC):
         guidance_scale: float = 1.0,
         **kwargs
     ) -> Image.Image:
-        """
-        Восстанавливает изображение из латентного шума.
-        Args:
-            latent_noise: тензор шума (обычно из метода invert).
-            prompt: текстовый промпт.
-            num_steps: количество шагов восстановления.
-            guidance_scale:
-            **kwargs:масштаб guidance (1.0 = без guidance). дополнительные аргументы.
-        Returns:
-            PIL Image.
-        """
-        pass
+        """Восстанавливает изображение из латентного шума."""
+        # Достаем контекст (например, эмбеддинги для Null-text), если он передан
+        context = kwargs.get("context", None)
+        with torch.no_grad():
+            restored_image = self.pipeline(
+                prompt=prompt,
+                num_inference_steps=num_steps,
+                latents=latent_noise,
+                guidance_scale=guidance_scale,
+                cross_attention_kwargs=context
+            ).images[0]
+
+        return restored_image
 
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
         """
