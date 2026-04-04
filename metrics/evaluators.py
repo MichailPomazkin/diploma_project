@@ -13,8 +13,8 @@ class ImageInversionEvaluator:
     def __init__(self, device="cuda"):
         self.device = device
         # Инициализируем метрики
-        self.psnr = PeakSignalNoiseRatio().to(device)
-        self.ssim = StructuralSimilarityIndexMeasure().to(device)
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
         # LPIPS требует загрузки весов (vgg по умолчанию)
         self.lpips_metric = LPIPS(net='vgg').to(device)
 
