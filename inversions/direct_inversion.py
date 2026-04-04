@@ -95,12 +95,16 @@ class DirectInverter(BaseInverter):
         timesteps = self.pipeline.scheduler.timesteps
 
         with torch.no_grad():
-            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.pipeline.encode_prompt(
-                prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True
+            prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
+                prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
 
-            embeds_input = torch.cat([negative_prompt_embeds, prompt_embeds])
-            pooled_input = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
+            empty_embeds, _, empty_pooled, _ = self.pipeline.encode_prompt(
+                prompt="", device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
+            )
+
+            embeds_input = torch.cat([empty_embeds, prompt_embeds])
+            pooled_input = torch.cat([empty_pooled, pooled_prompt_embeds])
 
             h, w = latent_noise.shape[-2] * 8, latent_noise.shape[-1] * 8
             time_ids = self.pipeline._get_add_time_ids(
