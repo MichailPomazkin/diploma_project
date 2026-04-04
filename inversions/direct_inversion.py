@@ -95,9 +95,12 @@ class DirectInverter(BaseInverter):
         timesteps = self.pipeline.scheduler.timesteps
 
         with torch.no_grad():
-            prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
+            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.pipeline.encode_prompt(
                 prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True
             )
+
+            embeds_input = torch.cat([negative_prompt_embeds, prompt_embeds])
+            pooled_input = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
 
             h, w = latent_noise.shape[-2] * 8, latent_noise.shape[-1] * 8
             time_ids = self.pipeline._get_add_time_ids(
@@ -118,8 +121,8 @@ class DirectInverter(BaseInverter):
                 latent_input = self.pipeline.scheduler.scale_model_input(latent_input, t)
 
                 noise_pred = self.pipeline.unet(
-                    latent_input, t, encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids_input}
+                    latent_input, t, encoder_hidden_states=embeds_input,
+                    added_cond_kwargs={"text_embeds": pooled_input, "time_ids": time_ids_input}
                 ).sample
 
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
