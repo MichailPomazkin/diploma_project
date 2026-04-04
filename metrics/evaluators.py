@@ -51,3 +51,4 @@ class ImageInversionEvaluator:
             "ssim": ssim_val,
             "lpips": lpips_val,
             "mse": mse_val
+        }
