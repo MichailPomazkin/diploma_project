@@ -9,7 +9,7 @@ from transformers import CLIPProcessor, CLIPModel
 class ImageInversionEvaluator:
     """
     Класс для оценки качества инверсии изображений.
-    Содержит методы для вычисления математических метрик.
+    Содержит методы для вычисления математических и семантических метрик.
     """
     def __init__(self, device="cuda"):
         self.device = device
@@ -19,9 +19,9 @@ class ImageInversionEvaluator:
         # LPIPS требует загрузки весов (vgg по умолчанию)
         self.lpips_metric = LPIPS(net='vgg').to(device)
 
+        print("Загружаем веса CLIP...")
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
 
     def preprocess(self, pil_image: Image.Image) -> torch.Tensor:
         """Приводит PIL изображение к тензору [1, 3, H, W] в диапазоне [0, 1]."""
@@ -43,7 +43,6 @@ class ImageInversionEvaluator:
         ssim_val = self.ssim(img1, img2).item()
 
         # 3. LPIPS (ближе к 0 - лучше)
-        # LPIPS ожидает вход в диапазоне [-1, 1]
         img1_lpips = img1 * 2.0 - 1.0
         img2_lpips = img2 * 2.0 - 1.0
         lpips_val = self.lpips_metric(img1_lpips, img2_lpips).item()
@@ -89,6 +88,16 @@ class ImageInversionEvaluator:
                 emb = self.clip_model.get_image_features(**inputs)
             else:
                 raise ValueError("Нужно передать либо текст, либо картинку")
+
+            # <--- ФИКС: Защита от разных версий библиотеки transformers --->
+            if not isinstance(emb, torch.Tensor):
+                # Достаем внутренний вектор (pooler_output)
+                raw_emb = emb.pooler_output if hasattr(emb, "pooler_output") else emb[0]
+                # Вручную проецируем в пространство CLIP
+                if text and not image:
+                    emb = self.clip_model.text_projection(raw_emb)
+                elif image and not text:
+                    emb = self.clip_model.visual_projection(raw_emb)
 
         return emb / emb.norm(p=2, dim=-1, keepdim=True)
 
