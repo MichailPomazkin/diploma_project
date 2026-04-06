@@ -82,22 +82,15 @@ class ImageInversionEvaluator:
             inputs.update({k: v.to(self.device) for k, v in image_inputs.items()})
 
         with torch.no_grad():
+            # ФИКС: Обращаемся к энкодерам напрямую! Это невозможно сломать.
             if text and not image:
-                emb = self.clip_model.get_text_features(**inputs)
+                outputs = self.clip_model.text_model(**inputs)
+                emb = self.clip_model.text_projection(outputs.pooler_output)
             elif image and not text:
-                emb = self.clip_model.get_image_features(**inputs)
+                outputs = self.clip_model.vision_model(**inputs)
+                emb = self.clip_model.visual_projection(outputs.pooler_output)
             else:
                 raise ValueError("Нужно передать либо текст, либо картинку")
-
-            # <--- ФИКС: Защита от разных версий библиотеки transformers --->
-            if not isinstance(emb, torch.Tensor):
-                # Достаем внутренний вектор (pooler_output)
-                raw_emb = emb.pooler_output if hasattr(emb, "pooler_output") else emb[0]
-                # Вручную проецируем в пространство CLIP
-                if text and not image:
-                    emb = self.clip_model.text_projection(raw_emb)
-                elif image and not text:
-                    emb = self.clip_model.visual_projection(raw_emb)
 
         return emb / emb.norm(p=2, dim=-1, keepdim=True)
 
