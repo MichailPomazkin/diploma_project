@@ -4,6 +4,7 @@ from PIL import Image
 import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from lpips import LPIPS
+from transformers import CLIPProcessor, CLIPModel
 
 class ImageInversionEvaluator:
     """
@@ -18,13 +19,17 @@ class ImageInversionEvaluator:
         # LPIPS требует загрузки весов (vgg по умолчанию)
         self.lpips_metric = LPIPS(net='vgg').to(device)
 
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+
     def preprocess(self, pil_image: Image.Image) -> torch.Tensor:
         """Приводит PIL изображение к тензору [1, 3, H, W] в диапазоне [0, 1]."""
         img = np.array(pil_image).astype(np.float32) / 255.0
         img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
         return img.to(self.device)
 
-    def calculate_metrics(self, original: Image.Image, reconstructed: Image.Image):
+    def calculate_metrics(self, original: Image.Image, reconstructed: Image.Image, prompt: str = None):
         """
         Считает метрики для пары изображений.
         """
