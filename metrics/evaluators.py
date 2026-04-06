@@ -72,7 +72,7 @@ class ImageInversionEvaluator:
         return outputs.logits_per_image[0][0].item()
 
     def get_clip_embeddings(self, image: Image.Image = None, text: str = None):
-        """Извлекает нормализованные эмбеддинги для текста или картинки."""
+        "Извлекает нормализованные эмбеддинги для текста или картинки."
         inputs = {}
         if text:
             text_inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True)
@@ -82,7 +82,6 @@ class ImageInversionEvaluator:
             inputs.update({k: v.to(self.device) for k, v in image_inputs.items()})
 
         with torch.no_grad():
-            # ФИКС: Обращаемся к энкодерам напрямую! Это невозможно сломать.
             if text and not image:
                 outputs = self.clip_model.text_model(**inputs)
                 emb = self.clip_model.text_projection(outputs.pooler_output)
