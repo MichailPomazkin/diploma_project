@@ -32,7 +32,7 @@ class DDIMInverter(BaseInverter):
         print("[DDIM] Кодируем изображение в латентный шум...")
         self.pipeline.scheduler = self.inverse_scheduler
 
-        # 1. Чистый препроцессинг через метод базового класса!
+        # 1. Чистый препроцессинг через метод базового класса
         image_tensor = self.preprocess_image(image)
 
         with torch.no_grad():
@@ -48,8 +48,9 @@ class DDIMInverter(BaseInverter):
                 do_classifier_free_guidance=False
             )
 
+            h, w = image_tensor.shape[-2:]
             time_ids = self.pipeline._get_add_time_ids(
-                (1024, 1024), (0, 0), (1024, 1024),
+                (h, w), (0, 0), (h, w),
                 dtype=prompt_embeds.dtype,
                 text_encoder_projection_dim=self.pipeline.text_encoder_2.config.projection_dim
             ).to(self.device)

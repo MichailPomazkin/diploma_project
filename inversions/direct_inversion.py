@@ -119,7 +119,7 @@ class DirectInverter(BaseInverter):
             max_blend_step = int(num_steps * blend_threshold)
 
             for i, t in enumerate(timesteps):
-                source_latents = context[i]
+                source_latents = context[i + 1]
 
                 latent_input = torch.cat([latents] * 2)
                 latent_input = self.pipeline.scheduler.scale_model_input(latent_input, t)

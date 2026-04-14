@@ -56,6 +56,39 @@ class BaseInverter(ABC):
 
         return restored_image
 
+    def run(
+            self,
+            image: Image.Image,
+            orig_prompt: str,
+            edit_prompt: str,
+            **kwargs
+    ) -> Image.Image:
+        """
+        Единая точка входа для конвейера тестирования (Оркестратора).
+        Выполняет полный цикл: инверсия оригинального изображения -> генерация с новым промптом.
+        """
+        # 1. Вызываем метод invert ( отработает по-разному для DDIM, Null-Text и т.д.)
+        invert_results = self.invert(
+            image=image,
+            prompt=orig_prompt,
+            num_steps=kwargs.get("num_steps", 50)
+        )
+
+        # Распаковываем результаты (безопасная проверка на случай возврата кортежа)
+        if isinstance(invert_results, tuple):
+            noise, context = invert_results
+        else:
+            noise = invert_results
+            context = None
+
+        # 2. Передаем шум и контекст в метод реконструкции
+        return self.reconstruct(
+            latent_noise=noise,
+            prompt=edit_prompt,
+            context=context,
+            num_steps=kwargs.get("num_steps", 50),
+            guidance_scale=kwargs.get("guidance_scale", 7.5))
+
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
         """
         Преобразует PIL Image в тензор, готовый для pipeline SDXL.
