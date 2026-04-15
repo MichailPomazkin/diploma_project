@@ -20,7 +20,7 @@ class ImageInversionEvaluator:
         self.lpips_metric = LPIPS(net='vgg').to(device)
 
         print("Загружаем веса CLIP...")
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True).to(device)
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
     def preprocess(self, pil_image: Image.Image) -> torch.Tensor:
