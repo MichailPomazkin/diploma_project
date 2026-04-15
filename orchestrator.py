@@ -1,9 +1,6 @@
 import os
 import re
 import traceback
-import os
-import re
-import traceback
 import pandas as pd
 import torch
 from datasets import load_dataset
@@ -17,6 +14,7 @@ class EvaluationPipeline:
     Оркестратор бенчмарка: загружает датасет, прогоняет изображения через
     указанные методы инверсии, собирает метрики и сохраняет результаты.
     """
+
     def __init__(self, methods_dict: Dict[str, Any], evaluator: Any, device: str = "cuda"):
         self.hf_repo = "UB-CVML-Group/PIE_Bench_pp"
         self.methods = methods_dict
@@ -36,14 +34,26 @@ class EvaluationPipeline:
                 print(f"  Категория: {subset_name}")
                 ds = load_dataset(self.hf_repo, subset_name, split=split)
 
-                for item in ds:
+                # ==========================================
+                # ИСПРАВЛЕННЫЙ БЛОК: Умный поиск колонок
+                # ==========================================
+                for idx, item in enumerate(ds):
+                    # Берем данные строго по названиям колонок
+                    src_prompt = item.get('source_prompt', '')
+                    tgt_prompt = item.get('target_prompt', '')
+
+                    # Берем ID из колонки 'id' (или используем индекс как страховку)
+                    img_id = str(item.get('id', idx))
+
                     self.dataset.append({
                         "category": subset_name,
                         "image": item['image'].convert('RGB'),
-                        "prompt_orig": item['original_prompt'],
-                        "prompt_edit": item['editing_prompt'],
-                        "image_id": item.get('image_id', 'unknown_id')
+                        "prompt_orig": src_prompt,
+                        "prompt_edit": tgt_prompt,
+                        "image_id": img_id
                     })
+                # ==========================================
+
             except Exception as e:
                 # Если категория не загружается (проблемы сети, отсутствие данных),
                 # логируем и продолжаем с остальными.
