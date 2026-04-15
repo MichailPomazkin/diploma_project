@@ -3,9 +3,9 @@ import argparse
 import torch
 from diffusers import StableDiffusionXLPipeline
 
-from inverters.ddim_inverter import DDIMInverter
-from inverters.direct_inverter import DirectInverter
-from inverters.null_text_inverter import NullTextInverter
+from inversions.ddim import DDIMInverter
+from inversions.direct_inversion import DirectInverter
+from inversions.null_text import NullTextInverter
 from metrics.evaluators import ImageInversionEvaluator
 from orchestrator import EvaluationPipeline
 
