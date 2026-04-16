@@ -11,8 +11,8 @@ from metrics.performance import PerformanceMonitor
 
 class EvaluationPipeline:
     """
-    Оркестратор бенчмарка: загружает датасет, прогоняет изображения через
-    указанные методы инверсии, собирает метрики и сохраняет результаты.
+    Оркестратор бенчмарка: загружает датасет PIE_Bench_pp, прогоняет изображения через
+    указанные методы инверсии (DDIM, Direct, Null-text), собирает метрики и сохраняет результаты.
     """
 
     def __init__(self, methods_dict: Dict[str, Any], evaluator: Any, device: str = "cuda"):
@@ -34,16 +34,11 @@ class EvaluationPipeline:
                 print(f"  Категория: {subset_name}")
                 ds = load_dataset(self.hf_repo, subset_name, split=split)
 
-                # ==========================================
-                # ИСПРАВЛЕННЫЙ БЛОК: Умный поиск колонок
-                # ==========================================
                 for idx, item in enumerate(ds):
-                    # Берем данные строго по названиям колонок
+                    # Поля датасета: source_prompt, target_prompt, id
                     src_prompt = item.get('source_prompt', '')
                     tgt_prompt = item.get('target_prompt', '')
-
-                    # Берем ID из колонки 'id' (или используем индекс как страховку)
-                    img_id = str(item.get('id', idx))
+                    img_id = str(item.get('id', idx))  # если id нет, используем индекс
 
                     self.dataset.append({
                         "category": subset_name,
@@ -52,11 +47,7 @@ class EvaluationPipeline:
                         "prompt_edit": tgt_prompt,
                         "image_id": img_id
                     })
-                # ==========================================
-
             except Exception as e:
-                # Если категория не загружается (проблемы сети, отсутствие данных),
-                # логируем и продолжаем с остальными.
                 print(f"  Ошибка при загрузке {subset_name}: {e}")
 
         print(f"Загружено изображений: {len(self.dataset)}")
@@ -73,7 +64,7 @@ class EvaluationPipeline:
         os.makedirs(os.path.join(results_dir, "errors"), exist_ok=True)
         csv_path = os.path.join(results_dir, output_csv)
 
-        # Восстановление предыдущего состояния, если файл результатов уже существует
+        # Восстановление предыдущего состояния (resume)
         processed_keys = set()
         if os.path.exists(csv_path):
             try:
@@ -102,7 +93,6 @@ class EvaluationPipeline:
                 if run_key in processed_keys:
                     continue
 
-                # Безопасные имена для файлов
                 safe_cat = self._sanitize_filename(category)
                 safe_id = self._sanitize_filename(img_id)
                 safe_meth = self._sanitize_filename(method_name)
@@ -111,6 +101,7 @@ class EvaluationPipeline:
 
                 try:
                     with PerformanceMonitor() as monitor:
+                        # У каждого инвертера свой run(image, prompt_orig, prompt_edit)
                         edited_image = method_pipeline.run(image, prompt_orig, prompt_edit)
 
                     if edited_image is None:
@@ -119,7 +110,8 @@ class EvaluationPipeline:
                     metrics_dict = self.evaluator.calculate_metrics(
                         original=image,
                         reconstructed=edited_image,
-                        prompt=prompt_edit
+                        prompt_orig=prompt_orig,
+                        prompt_edit=prompt_edit
                     )
 
                     img_filename = f"{safe_cat}_{safe_id}_{safe_meth}.png"
@@ -161,7 +153,7 @@ class EvaluationPipeline:
                         pd.DataFrame(self.results).to_csv(csv_path, index=False)
                         processed_keys.add(run_key)
 
-                    # Освобождение памяти GPU после каждой итерации
+                    # Освобождение памяти GPU
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 

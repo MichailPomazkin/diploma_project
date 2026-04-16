@@ -1,7 +1,7 @@
 import sys
 import argparse
 import torch
-from diffusers import StableDiffusionXLPipeline
+from diffusers import StableDiffusionXLPipeline, AutoencoderKL
 
 from inversions.ddim import DDIMInverter
 from inversions.direct_inversion import DirectInverter
