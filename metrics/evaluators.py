@@ -44,18 +44,12 @@ class ImageInversionEvaluator:
             img1 = self.preprocess(original)
             img2 = self.preprocess(reconstructed)
 
-            # 1. PSNR (выше - лучше)
             psnr_val = self.psnr(img1, img2).item()
-
-            # 2. SSIM (ближе к 1 - лучше)
             ssim_val = self.ssim(img1, img2).item()
 
-            # 3. LPIPS (ближе к 0 - лучше)
             img1_lpips = img1 * 2.0 - 1.0
             img2_lpips = img2 * 2.0 - 1.0
             lpips_val = self.lpips_metric(img1_lpips, img2_lpips).item()
-
-            # 4. MSE (ниже - лучше)
             mse_val = F.mse_loss(img1, img2).item()
 
             results = {
@@ -65,18 +59,13 @@ class ImageInversionEvaluator:
                 "mse": mse_val
             }
 
-            # 5. Академический CLIP-score (Косинусное сходство)
             if prompt_edit:
-                # Насколько результат соответствует целевому тексту
                 results["clip_tgt_recon"] = self.calculate_clip_score(reconstructed, prompt_edit)
-                # Baseline: насколько оригинал соответствовал целевому тексту
                 results["clip_tgt_orig"] = self.calculate_clip_score(original, prompt_edit)
 
             if prompt_orig:
-                # Насколько оригинал соответствовал своему описанию
                 results["clip_src_orig"] = self.calculate_clip_score(original, prompt_orig)
 
-            # 6. Directional CLIP (вектор редактирования)
             if prompt_orig and prompt_edit:
                 results["directional_clip"] = self.calculate_directional_clip(
                     original, reconstructed, prompt_orig, prompt_edit
@@ -85,40 +74,44 @@ class ImageInversionEvaluator:
         return results
 
     def get_clip_embeddings(self, image: Image.Image = None, text: str = None):
-        """Извлекает нормализованные эмбеддинги для текста или картинки."""
+        """
+        Извлекает нормализованные эмбеддинги для текста или картинки.
+        Возвращает тензор формы (1, embedding_dim).
+        """
         with torch.no_grad():
-            if text and not image:
-                inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True)
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                # Официальные методы HF уже возвращают векторы с L2-нормой = 1
-                emb = self.clip_model.get_text_features(**inputs)
-            elif image and not text:
-                inputs = self.clip_processor(images=image, return_tensors="pt")
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                emb = self.clip_model.get_image_features(**inputs)
+            if text is not None:
+                inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
+                # Ручное извлечение через text_model (совместимо со старыми версиями transformers)
+                text_outputs = self.clip_model.text_model(**inputs)
+                pooled = text_outputs.pooler_output  # shape (1, 768) для ViT-B/32
+                emb = self.clip_model.text_projection(pooled)  # проекция в 512
+            elif image is not None:
+                inputs = self.clip_processor(images=image, return_tensors="pt").to(self.device)
+                vision_outputs = self.clip_model.vision_model(**inputs)
+                pooled = vision_outputs.pooler_output  # shape (1, 768)
+                emb = self.clip_model.visual_projection(pooled)  # проекция в 512
             else:
                 raise ValueError("Нужно передать либо текст, либо картинку")
 
+        # Нормализация (L2)
+        emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
         return emb
 
     def calculate_clip_score(self, image: Image.Image, prompt: str) -> float:
-        """Считает косинусное сходство между эмбеддингом картинки и текста [-1, 1]."""
+        """Косинусное сходство между эмбеддингами изображения и текста (от -1 до 1)."""
         img_emb = self.get_clip_embeddings(image=image)
         txt_emb = self.get_clip_embeddings(text=prompt)
         return F.cosine_similarity(img_emb, txt_emb).item()
 
     def calculate_directional_clip(self, img_orig: Image.Image, img_edit: Image.Image,
                                    prompt_orig: str, prompt_edit: str) -> float:
-        """Считает Directional CLIP (насколько вектор изменения картинки совпадает с вектором текста)."""
+        """Directional CLIP: косинусное сходство между векторами изменений изображения и текста."""
         img_orig_emb = self.get_clip_embeddings(image=img_orig)
         img_edit_emb = self.get_clip_embeddings(image=img_edit)
-
         txt_orig_emb = self.get_clip_embeddings(text=prompt_orig)
         txt_edit_emb = self.get_clip_embeddings(text=prompt_edit)
 
         img_diff = img_edit_emb - img_orig_emb
         txt_diff = txt_edit_emb - txt_orig_emb
-
-        directional_similarity = F.cosine_similarity(img_diff, txt_diff).item()
-        return directional_similarity
+        return F.cosine_similarity(img_diff, txt_diff).item()
 
