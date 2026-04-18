@@ -39,11 +39,17 @@ def main():
 
     print(f"Инициализация пайплайна. Устройство: {device.upper()}, тип данных: {dtype}")
 
-    print("Загрузка базовой модели Stable Diffusion XL 1.0...")
+    print("Загрузка модели SDXL с исправленным VAE...")
     try:
-        # Умная загрузка: используем fp16 только если мы на видеокарте (GPU)
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            use_safetensors=True
+        ).to(device)
+
         pipe_kwargs = {
             "pretrained_model_name_or_path": "stabilityai/stable-diffusion-xl-base-1.0",
+            "vae": vae,
             "torch_dtype": dtype,
             "use_safetensors": True
         }
@@ -51,37 +57,31 @@ def main():
             pipe_kwargs["variant"] = "fp16"
 
         pipe = StableDiffusionXLPipeline.from_pretrained(**pipe_kwargs).to(device)
+        pipe.upcast_vae = False
 
-        # Полное отключение цензуры и связанных с ней компонентов для чистоты эксперимента
         if hasattr(pipe, "safety_checker"):
             pipe.safety_checker = None
         if hasattr(pipe, "feature_extractor"):
             pipe.feature_extractor = None
 
-        # ОПЦИОНАЛЬНО: Раскомментируй строку ниже, если при запуске Null-Text будет ошибка Out Of Memory.
-        # Это сэкономит VRAM, но замедлит генерацию на 20-30%.
-        # pipe.enable_model_cpu_offload()
-
         if device == "cuda":
             vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
-            print(f"Модель успешно загружена. Использовано VRAM: {vram_used:.2f} GB")
-
+            print(f"Модель загружена. VRAM: {vram_used:.2f} GB")
     except Exception as e:
-        print(f"Критическая ошибка при загрузке модели SDXL: {e}")
+        print(f"Ошибка загрузки модели: {e}")
         sys.exit(1)
 
     print("Инициализация методов инверсии...")
     methods_dict = {
         "DDIM": DDIMInverter(pipe),
         "DirectInversion": DirectInverter(pipe),
-        # NullTextInverter закомментирован для первого прогона.
-        # "NullText": NullTextInverter(pipe)
+        "NullText": NullTextInverter(pipe),   # всегда включён
     }
 
     print("Инициализация модуля оценки качества...")
     evaluator = ImageInversionEvaluator(device=device)
 
-    print("Настройка параметров конвейера данных...")
+    print("Настройка конвейера...")
     pipeline = EvaluationPipeline(
         methods_dict=methods_dict,
         evaluator=evaluator,
@@ -89,31 +89,22 @@ def main():
     )
 
     pipeline.load_data(subsets=args.subsets, split=args.split)
-
     results_df = pipeline.run_evaluation(
         results_dir="results",
         output_csv="evaluation_results.csv"
     )
 
-    print("\nПроцесс генерации и оценки завершен.")
-
-    # Безопасное формирование итоговой статистики
+    print("\nПроцесс завершён.")
     if results_df is not None and not results_df.empty:
         total_runs = len(results_df)
         errors_df = results_df[results_df['error'].notna()]
         total_errors = len(errors_df)
         successful_runs = total_runs - total_errors
-
-        print(f"Итоговая статистика:")
-        print(f"Всего обработано: {total_runs}")
-        print(f"Успешно: {successful_runs}")
-        print(f"Ошибок: {total_errors}")
-
+        print(f"Всего обработано: {total_runs}, Успешно: {successful_runs}, Ошибок: {total_errors}")
         if total_errors > 0:
-            print("Внимание: зафиксированы ошибки выполнения. Подробности сохранены в директории results/errors/.")
+            print("Ошибки сохранены в results/errors/")
     else:
-        print("Внимание: Нет результатов для анализа (возможно, датасет пуст или произошла ошибка).")
-
+        print("Нет результатов для анализа.")
 
 if __name__ == "__main__":
     main()
