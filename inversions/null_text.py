@@ -10,8 +10,7 @@ from .base_inverter import BaseInverter
 
 class NullTextInverter(BaseInverter):
     """
-    Реализация метода Null-text Inversion для SDXL.
-
+    Реализация метода Null-text Inversion
     Основная идея:
         - На этапе invert получаем опорную DDIM-траекторию (z_0 → z_T) для исходного изображения.
         - Затем для каждого шага t (от T до 1) оптимизируем unconditional text embeddings (пустой промпт)
@@ -40,8 +39,8 @@ class NullTextInverter(BaseInverter):
             prompt: str,
             num_steps: int = 50,
             guidance_scale: float = 7.5,
-            num_inner_steps: int = 10,
-            learning_rate: float = 1e-2,
+            num_inner_steps: int = 5,       # уменьшено для стабильности и скорости
+            learning_rate: float = 1e-3,    # пониженная скорость обучения для SDXL
             **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -109,22 +108,25 @@ class NullTextInverter(BaseInverter):
         for i, t in enumerate(forward_timesteps):
             target_latent = trajectory[i + 1].detach()   # целевой латент z_{T-i-1}
 
-            # Клонируем начальный пустой эмбеддинг и делаем его обучаемым
-            uncond_embeds_opt = self.empty_embeds.clone().detach().requires_grad_(True)
+            # Клонируем начальный пустой эмбеддинг, переводим в float32 для устойчивости градиентов
+            uncond_embeds_opt = self.empty_embeds.clone().detach().to(torch.float32).requires_grad_(True)
             optimizer = Adam([uncond_embeds_opt], lr=learning_rate)
 
             pred_latent = None   # будет хранить предсказание на последней итерации
 
             # Внутренний цикл градиентного спуска для подбора эмбеддинга на данном шаге t
-            for _ in range(num_inner_steps):
+            for inner_step in range(num_inner_steps):
                 optimizer.zero_grad()
+
+                # Возвращаем эмбеддинг в fp16 для прогона через UNet
+                uncond_fp16 = uncond_embeds_opt.to(dtype=prompt_embeds.dtype)
 
                 # Для CFG нужно два экземпляра латента (conditional и unconditional)
                 latent_input = torch.cat([current_latent] * 2)
                 latent_input = self.forward_scheduler.scale_model_input(latent_input, t)
 
                 # Конкатенируем оптимизируемый unconditional эмбеддинг с текстовым эмбеддингом
-                embeds_input = torch.cat([uncond_embeds_opt, prompt_embeds])
+                embeds_input = torch.cat([uncond_fp16, prompt_embeds])
                 pooled_input = torch.cat([self.empty_pooled, pooled_prompt_embeds])
                 time_ids_input = torch.cat([time_ids, time_ids])
 
@@ -139,16 +141,34 @@ class NullTextInverter(BaseInverter):
                 pred_latent = self.forward_scheduler.step(noise_pred_cfg, t, current_latent).prev_sample
                 loss = F.mse_loss(pred_latent.float(), target_latent.float())
 
+                # Защита: при обнаружении NaN в loss или в предсказании – прерываем итерации
+                if torch.isnan(loss) or torch.isnan(pred_latent).any() or torch.isinf(pred_latent).any():
+                    print(f"  [Null-text] NaN/Inf на шаге {i}, итерация {inner_step}. Прерываем оптимизацию.")
+                    pred_latent = target_latent
+                    break
+
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_([uncond_embeds_opt], 1.0)  # защита от взрыва градиентов
                 optimizer.step()
 
-            # Сохраняем оптимизированный эмбеддинг для данного шага
-            optimized_uncond_embeddings.append(uncond_embeds_opt.detach())
+                # Клиппинг самих эмбеддингов, чтобы они не уходили в бесконечность
+                with torch.no_grad():
+                    uncond_embeds_opt.clamp_(-10.0, 10.0)
+
+            # Сохраняем оптимизированный эмбеддинг для данного шага (возвращаем в fp16)
+            optimized_uncond_embeddings.append(uncond_embeds_opt.detach().to(dtype=prompt_embeds.dtype))
 
             # Используем предсказание с последней итерации как текущий латент для следующего шага.
-            # Это избегает дополнительного forward-прогона.
+            # Если ошибка слишком велика, используем целевой латент из траектории (fallback).
             if pred_latent is not None:
-                current_latent = pred_latent.detach()
+                mse_error = F.mse_loss(pred_latent.float(), target_latent.float()).item()
+                if mse_error > 1.0:
+                    print(f"  [Null-text] Ошибка велика (MSE={mse_error:.4f}). Сброс на целевой латент.")
+                    current_latent = target_latent.clone()
+                else:
+                    current_latent = pred_latent.detach()
+            else:
+                current_latent = target_latent.clone()
 
         return latent_noise, optimized_uncond_embeddings
 
