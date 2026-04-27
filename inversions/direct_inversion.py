@@ -8,21 +8,23 @@ from .base_inverter import BaseInverter
 
 class DirectInverter(BaseInverter):
     """
-    Реализация метода Direct Inversion для SDXL.
+    Реализация метода Direct Inversion для модели Stable Diffusion XL (SDXL).
 
-    Идея:
-        - На этапе invert сохраняется полная траектория латентных векторов от z_0 до z_T.
-        - На этапе reconstruct эта траектория используется для «привязки» генерации
-          к исходной структуре изображения при изменённом текстовом промпте.
-          Это позволяет редактировать изображение (замена объекта, фона, стиля),
-          сохраняя композицию и геометрию оригинала.
+    Принцип работы:
+        1. На этапе invert выполняется обратный процесс: от исходного латента z0
+           к зашумлённому zT. Все промежуточные латенты сохраняются в траекторию.
+        2. На этапе reconstruct при генерации нового изображения на первых шагах
+           (обычно до 70% процесса) выполняется линейное смешивание текущего латента
+           с сохранённым из траектории. Это обеспечивает сохранение композиции
+           и геометрии исходного изображения при изменении текстового описания.
     """
 
     def __init__(self, pipeline: StableDiffusionXLPipeline):
         super().__init__(pipeline)
 
-        # Создаём независимые копии шедулеров на основе конфигурации текущего пайплайна.
-        # Это позволяет не загружать их из интернета и не влиять на глобальное состояние.
+        # Создаются отдельные экземпляры планировщиков для инвертера.
+        # Это позволяет изменять параметры шагов без влияния на глобальное состояние
+        # переданного пайплайна.
         self.inverse_scheduler = DDIMInverseScheduler.from_config(self.pipeline.scheduler.config)
         self.forward_scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config)
 
@@ -31,32 +33,48 @@ class DirectInverter(BaseInverter):
             image: Image.Image,
             prompt: str,
             num_steps: int = 50,
+            mask: Optional[Image.Image] = None,
             **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Преобразует изображение в шум и сохраняет траекторию всех промежуточных латентов.
+        Выполняет обратный процесс: преобразует входное изображение в шум
+        и возвращает полную траекторию промежуточных латентов.
+
+        Параметры:
+            image: исходное изображение в формате PIL.
+            prompt: текстовое описание (используется для согласования с UNet).
+            num_steps: количество шагов диффузионного процесса.
+            mask: не используется в данной реализации, присутствует для совместимости.
+            **kwargs: дополнительные аргументы.
 
         Возвращает:
-            - latent_noise: финальный латентный шум z_T
-            - trajectory: список латентов от z_T до z_0 (в порядке от шума к чистому изображению)
+            Кортеж (latent_noise, trajectory), где latent_noise — зашумлённый латент zT,
+            trajectory — список латентов от zT до z0 в порядке убывания шума.
         """
-        print("[Direct Inversion] Извлечение опорной траектории (детерминировано)...")
+        print("[Direct Inversion] Извлечение опорной траектории...")
+
+        # Предобработка изображения: преобразование в тензор, нормализация, приведение размера.
         image_tensor = self.preprocess_image(image)
 
         with torch.no_grad():
-            # Детерминированное кодирование: берём центр распределения (mode) вместо случайной выборки.
-            # Это гарантирует, что повторные запуски дадут одинаковый результат.
+            # Кодирование изображения в латентное пространство VAE.
+            # Используется метод mode() для детерминированного сжатия (точка максимума распределения),
+            # что обеспечивает воспроизводимость результатов.
             latents = self.pipeline.vae.encode(image_tensor).latent_dist.mode()
             latents = latents * self.pipeline.vae.config.scaling_factor
+            latents = latents.to(self.device)
 
-            # Кодируем текстовый промпт. do_classifier_free_guidance=False, потому что
-            # на этапе инверсии CFG не применяется (мы просто идём по обратному пути).
+            # Кодирование текстового промпта в эмбеддинги.
+            # На этапе инверсии CFG (classifier-free guidance) отключён.
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
+            # Явное перемещение на устройство GPU, так как encode_prompt может вернуть тензоры на CPU.
+            prompt_embeds = prompt_embeds.to(self.device)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
-            # SDXL требует дополнительных временных идентификаторов (time_ids), которые
-            # кодируют размеры выходного изображения. Они передаются в UNet через added_cond_kwargs.
+            # Подготовка временных идентификаторов (time_ids), необходимых для SDXL.
+            # Они содержат информацию о разрешении и параметрах кропа исходного изображения.
             h, w = image_tensor.shape[-2:]
             time_ids = self.pipeline._get_add_time_ids(
                 (h, w), (0, 0), (h, w), dtype=prompt_embeds.dtype,
@@ -65,31 +83,31 @@ class DirectInverter(BaseInverter):
 
             added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
 
-        # Настраиваем обратный шедулер на нужное количество шагов
+        # Настройка планировщика обратного процесса.
         self.inverse_scheduler.set_timesteps(num_steps, device=self.device)
         timesteps = self.inverse_scheduler.timesteps
 
-        # Начинаем с чистого латента z_0
+        # Инициализация латента исходным изображением в латентном пространстве.
         trajectory = [latents.clone()]
         current_latents = latents.clone()
 
         with torch.no_grad():
             for t in timesteps:
-                # Предсказываем шум, который нужно добавить, чтобы перейти от текущего латента
-                # к более зашумлённому (обратный процесс DDIM)
+                # Предсказание шума с помощью UNet.
                 noise_pred = self.pipeline.unet(
                     current_latents, t, encoder_hidden_states=prompt_embeds,
                     added_cond_kwargs=added_cond_kwargs
                 ).sample
 
-                # Делаем шаг инверсии: получаем латент для предыдущего (более шумного) шага
+                # Шаг обратного процесса: добавление предсказанного шума.
                 current_latents = self.inverse_scheduler.step(noise_pred, t, current_latents).prev_sample
                 trajectory.append(current_latents.clone())
 
-        # Траектория сейчас: [z_0, z_1, ..., z_T] (от чистого к шуму).
-        # Переворачиваем, чтобы первый элемент был z_T (шум), последний — z_0.
+        # Траектория построена от z0 к zT. Для удобства использования в генерации
+        # порядок обращается: первый элемент соответствует zT (максимальный шум),
+        # последний — z0.
         trajectory = list(reversed(trajectory))
-        latent_noise = trajectory[0]   # z_T
+        latent_noise = trajectory[0]
 
         return latent_noise, trajectory
 
@@ -102,30 +120,44 @@ class DirectInverter(BaseInverter):
             context: Optional[List[torch.Tensor]] = None,
             alpha: float = 0.5,
             blend_threshold: float = 0.7,
+            mask: Optional[Image.Image] = None,
             **kwargs
     ) -> Image.Image:
         """
-        Восстанавливает изображение из шума, используя сохранённую траекторию (context).
+        Выполняет прямой процесс генерации изображения с использованием опорной траектории.
+
+        Если контекст (сохранённая траектория) не передан, выполняется стандартная DDIM-генерация.
+        При наличии контекста на первых blend_threshold * num_steps шагах производится
+        линейная интерполяция между текущим латентом и соответствующим латентом из траектории.
 
         Параметры:
-            alpha: сила смешивания с исходной траекторией (0 – только генерация, 1 – только исходный латент)
-            blend_threshold: доля шагов (от начала), на которых применяется смешивание.
-                             Например, 0.7 означает, что на первых 70% шагов мы подмешиваем исходную траекторию.
+            latent_noise: начальный шум (обычно zT, полученный из метода invert).
+            prompt: текстовое описание для генерации.
+            num_steps: количество шагов генерации.
+            guidance_scale: масштаб classifier-free guidance (1.0 — без CFG).
+            context: список латентов опорной траектории (от zT до z0).
+            alpha: коэффициент смешивания (0 — только новый латент, 1 — только исходный).
+            blend_threshold: доля первых шагов, на которых применяется смешивание.
+            mask: не используется, присутствует для совместимости.
+            **kwargs: дополнительные аргументы.
+
+        Возвращает:
+            Сгенерированное изображение в формате PIL.
         """
-        # Если контекст не передан — выполняем обычную реконструкцию (как в DDIM)
         if context is None:
-            print("[Direct Inversion] Внимание: контекст не передан, выполняется обычный DDIM.")
+            print("[Direct Inversion] Траектория не найдена. Выполняется стандартная DDIM-генерация.")
             return super().reconstruct(latent_noise, prompt, num_steps, guidance_scale, **kwargs)
 
-        # Проверяем, что длина контекста совпадает с количеством шагов + 1
         if len(context) != num_steps + 1:
-            raise ValueError(f"Длина контекста ({len(context)}) не совпадает с num_steps + 1 ({num_steps + 1})")
+            raise ValueError(
+                f"Несоответствие размерности: длина контекста ({len(context)}) "
+                f"должна быть равна количеству шагов плюс один ({num_steps + 1})."
+            )
 
-        print(f"[Direct Inversion] Направленная реконструкция (alpha={alpha}, threshold={blend_threshold})...")
+        print(f"[Direct Inversion] Запуск направленной генерации. Коэффициент смешивания: {alpha}, "
+              f"длительность смешивания: {blend_threshold}.")
 
-        # Временно подменяем шедулер пайплайна на прямой DDIM-шедулер.
-        # Это нужно, потому что базовый метод reconstruct использует self.pipeline.scheduler.
-        # Блок try/finally гарантирует возврат исходного шедулера даже при ошибке.
+        # Временная замена планировщика в пайплайне на собственный экземпляр.
         original_scheduler = self.pipeline.scheduler
         self.pipeline.scheduler = self.forward_scheduler
 
@@ -133,27 +165,32 @@ class DirectInverter(BaseInverter):
             self.pipeline.scheduler.set_timesteps(num_steps, device=self.device)
             timesteps = self.pipeline.scheduler.timesteps
 
-            # CFG (Classifier-Free Guidance) ускоряет и экономит память, если guidance_scale == 1.0
             do_classifier_free_guidance = guidance_scale > 1.0
 
             with torch.no_grad():
-                # Кодируем текстовый промпт (без CFG, только один раз)
+                # Кодирование текста для генерации.
                 prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                     prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
                 )
+                prompt_embeds = prompt_embeds.to(self.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
-                # Если включён CFG, добавляем пустые эмбеддинги для безусловной ветки
                 if do_classifier_free_guidance:
+                    # Для CFG требуются также эмбеддинги пустого промпта (безусловная ветка).
                     empty_embeds, _, empty_pooled, _ = self.pipeline.encode_prompt(
                         prompt="", device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
                     )
-                    embeds_input = torch.cat([empty_embeds, prompt_embeds])      # [uncond, cond]
+                    empty_embeds = empty_embeds.to(self.device)
+                    empty_pooled = empty_pooled.to(self.device)
+
+                    # Объединение условной и безусловной веток в один батч.
+                    embeds_input = torch.cat([empty_embeds, prompt_embeds])
                     pooled_input = torch.cat([empty_pooled, pooled_prompt_embeds])
                 else:
                     embeds_input = prompt_embeds
                     pooled_input = pooled_prompt_embeds
 
-                # Вычисляем размеры для time_ids. Масштабный коэффициент VAE получаем из пайплайна.
+                # Определение размера изображения для time_ids.
                 vae_scale_factor = getattr(self.pipeline, "vae_scale_factor", 8)
                 h, w = latent_noise.shape[-2] * vae_scale_factor, latent_noise.shape[-1] * vae_scale_factor
 
@@ -170,48 +207,40 @@ class DirectInverter(BaseInverter):
                 latents = latent_noise.clone()
                 max_blend_step = int(num_steps * blend_threshold)
 
-                # Основной цикл генерации
                 for i, t in enumerate(timesteps):
-                    # Берём соответствующий латент из сохранённой траектории (z_{T-i})
                     source_latents = context[i]
 
-                    # Подготовка входа для UNet: если CFG — удваиваем батч
                     if do_classifier_free_guidance:
                         latent_input = torch.cat([latents] * 2)
                     else:
                         latent_input = latents
 
-                    # Масштабирование входа в соответствии с сигмой шедулера (важно для DDIM)
                     latent_input = self.pipeline.scheduler.scale_model_input(latent_input, t)
 
-                    # Предсказание шума
                     noise_pred = self.pipeline.unet(
                         latent_input, t, encoder_hidden_states=embeds_input,
                         added_cond_kwargs={"text_embeds": pooled_input, "time_ids": time_ids_input}
                     ).sample
 
-                    # Применяем CFG, если нужно
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    # Шаг DDIM вперёд (добавление шума → очистка)
+                    # Шаг DDIM: удаление предсказанной составляющей шума.
                     latents = self.pipeline.scheduler.step(noise_pred, t, latents).prev_sample
 
-                    # Смешивание с исходной траекторией на первых max_blend_step шагах
-                    # Это ключевая идея Direct Inversion: мы «привязываем» генерацию к оригинальной структуре.
+                    # Применение смешивания с опорной траекторией на ранних шагах.
                     if i < max_blend_step:
                         latents = alpha * source_latents + (1 - alpha) * latents
 
-                # Декодируем латенты обратно в пиксельное пространство через VAE
+                # Декодирование латента в пиксельное пространство.
                 image = self.pipeline.vae.decode(
                     latents / self.pipeline.vae.config.scaling_factor, return_dict=False
                 )[0]
-                # Преобразуем тензор в PIL-изображение
                 image = self.pipeline.image_processor.postprocess(image, output_type="pil")[0]
 
             return image
 
         finally:
-            # Восстанавливаем исходный шедулер, чтобы не повлиять на другие инвертеры
+            # Восстановление исходного планировщика пайплайна.
             self.pipeline.scheduler = original_scheduler

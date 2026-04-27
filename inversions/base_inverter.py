@@ -60,8 +60,8 @@ class BaseInverter(ABC):
     def run(
             self,
             image: Image.Image,
-            orig_prompt: str,
-            edit_prompt: str,
+            prompt_orig: str,
+            prompt_edit: str,
             mask: Optional[Image.Image] = None,
             **kwargs
     ) -> Image.Image:
@@ -72,7 +72,7 @@ class BaseInverter(ABC):
         # Вызываем метод invert, передавая маску, если она есть
         invert_results = self.invert(
             image=image,
-            prompt=orig_prompt,
+            prompt=prompt_orig,
             num_steps=kwargs.get("num_steps", 50),
             mask=mask,
             **kwargs
@@ -87,7 +87,7 @@ class BaseInverter(ABC):
         # Реконструкция с новым промптом
         return self.reconstruct(
             latent_noise=noise,
-            prompt=edit_prompt,
+            prompt=prompt_edit,
             context=context,
             num_steps=kwargs.get("num_steps", 50),
             guidance_scale=kwargs.get("guidance_scale", 7.5)
