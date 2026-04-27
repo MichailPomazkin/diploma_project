@@ -24,8 +24,8 @@ class EvaluationPipeline:
         self.results: List[Dict[str, Any]] = []
         self.dataset: List[Dict[str, Any]] = []
 
-    def load_data(self, subsets: List[str], split: str = "test"):
-        """Загружает указанные подмножества датасета из Hugging Face."""
+    def load_data(self, subsets: List[str], split: str = "V1"):
+        """Загружает указанные подмножества датасета PIE_Bench_pp из Hugging Face."""
         self.dataset = []
         print(f"Загрузка данных из {self.hf_repo} (split='{split}')...")
 
@@ -35,14 +35,21 @@ class EvaluationPipeline:
                 ds = load_dataset(self.hf_repo, subset_name, split=split)
 
                 for idx, item in enumerate(ds):
-                    # Поля датасета: source_prompt, target_prompt, id
                     src_prompt = item.get('source_prompt', '')
                     tgt_prompt = item.get('target_prompt', '')
-                    img_id = str(item.get('id', idx))  # если id нет, используем индекс
+                    img_id = str(item.get('id', idx))
+
+                    # Извлекаем маску из датасета. Конвертируем в ч/б ('L'), чтобы
+                    # исключить проблемы с многоканальными (RGB) масками.
+                    # Если маски в датасете нет, mask_img останется None.
+                    mask_img = item.get('mask')
+                    if mask_img is not None:
+                        mask_img = mask_img.convert('L')
 
                     self.dataset.append({
                         "category": subset_name,
                         "image": item['image'].convert('RGB'),
+                        "mask": mask_img,  # Сохраняем маску в общий словарь
                         "prompt_orig": src_prompt,
                         "prompt_edit": tgt_prompt,
                         "image_id": img_id
@@ -87,6 +94,8 @@ class EvaluationPipeline:
             prompt_edit = item['prompt_edit']
             category = item['category']
             img_id = item['image_id']
+            # Извлекаем маску для текущей картинки
+            mask = item.get('mask')
 
             for method_name, method_pipeline in self.methods.items():
                 run_key = f"{category}_{img_id}_{method_name}"
@@ -101,8 +110,14 @@ class EvaluationPipeline:
 
                 try:
                     with PerformanceMonitor() as monitor:
-                        # У каждого инвертера свой run(image, prompt_orig, prompt_edit)
-                        edited_image = method_pipeline.run(image, prompt_orig, prompt_edit)
+                        # Передаём маску в метод run. Базовые методы (например, DDIM),
+                        # которые не используют маску, просто проигнорируют её через **kwargs.
+                        edited_image = method_pipeline.run(
+                            image=image,
+                            prompt_orig=prompt_orig,
+                            prompt_edit=prompt_edit,
+                            mask=mask
+                        )
 
                     if edited_image is None:
                         raise ValueError(f"Метод {method_name} вернул None вместо изображения.")
@@ -153,7 +168,7 @@ class EvaluationPipeline:
                         pd.DataFrame(self.results).to_csv(csv_path, index=False)
                         processed_keys.add(run_key)
 
-                    # Освобождение памяти GPU
+                    # Освобождение памяти GPU для предотвращения OOM (Out Of Memory)
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 

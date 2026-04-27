@@ -10,6 +10,22 @@ from metrics.evaluators import ImageInversionEvaluator
 from orchestrator import EvaluationPipeline
 
 
+class InverterWrapper:
+    """
+    Обёртка, позволяющая передавать дополнительные аргументы (например, use_spatial_mask)
+    в метод run инвертера, не меняя код оркестратора.
+    """
+    def __init__(self, inverter_instance, **custom_kwargs):
+        self.inverter = inverter_instance
+        self.custom_kwargs = custom_kwargs
+
+    def run(self, image, prompt_orig, prompt_edit, mask=None, **kwargs):
+        final_kwargs = {**kwargs, **self.custom_kwargs}
+        if mask is not None:
+            final_kwargs['mask'] = mask
+        return self.inverter.run(image, prompt_orig, prompt_edit, **final_kwargs)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Пайплайн оценки методов инверсии для SDXL.")
     parser.add_argument(
@@ -25,8 +41,8 @@ def parse_args():
     parser.add_argument(
         "--split",
         type=str,
-        default="test",
-        help="Сплит датасета для загрузки."
+        default="V1",
+        help="Сплит датасета для загрузки (PIE_Bench_pp использует 'V1')."
     )
     return parser.parse_args()
 
@@ -43,7 +59,7 @@ def main():
     try:
         vae = AutoencoderKL.from_pretrained(
             "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            torch_dtype=dtype,
             use_safetensors=True
         ).to(device)
 
@@ -72,10 +88,13 @@ def main():
         sys.exit(1)
 
     print("Инициализация методов инверсии...")
+    base_null = NullTextInverter(pipe)
+
     methods_dict = {
         "DDIM": DDIMInverter(pipe),
         "DirectInversion": DirectInverter(pipe),
-        "NullText": NullTextInverter(pipe),   # всегда включён
+        "NullText_Original": InverterWrapper(base_null, use_spatial_mask=False),
+        "NullText_Masked": InverterWrapper(base_null, use_spatial_mask=True),
     }
 
     print("Инициализация модуля оценки качества...")
@@ -102,9 +121,10 @@ def main():
         successful_runs = total_runs - total_errors
         print(f"Всего обработано: {total_runs}, Успешно: {successful_runs}, Ошибок: {total_errors}")
         if total_errors > 0:
-            print("Ошибки сохранены в results/errors/")
+            print("Подробности ошибок в results/errors/")
     else:
         print("Нет результатов для анализа.")
+
 
 if __name__ == "__main__":
     main()

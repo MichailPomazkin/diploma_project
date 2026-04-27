@@ -11,13 +11,13 @@ class DDIMInverter(BaseInverter):
     DDIM инверсия для SDXL.
 
     Использует детерминистический обратный процесс для получения латентного шума из изображения.
+    Маска не поддерживается (игнорируется).
     """
 
     def __init__(self, pipeline: StableDiffusionXLPipeline):
         super().__init__(pipeline)
 
-        # Создаём копии шедулеров из конфигурации текущего пайплайна,
-        # чтобы не загружать их повторно из интернета.
+        # Создаём копии шедулеров из конфигурации текущего пайплайна
         self.inverse_scheduler = DDIMInverseScheduler.from_config(pipeline.scheduler.config)
         self.forward_scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
 
@@ -33,15 +33,13 @@ class DDIMInverter(BaseInverter):
         """
         print("[DDIM] Кодируем изображение в латентный шум...")
 
-        # Предобработка изображения (нормализация, приведение к тензору)
         image_tensor = self.preprocess_image(image)
 
         with torch.no_grad():
-            # Кодирование в латентное пространство VAE
-            latents = self.pipeline.vae.encode(image_tensor).latent_dist.sample()
+            # Детерминированное кодирование VAE (берём моду распределения)
+            latents = self.pipeline.vae.encode(image_tensor).latent_dist.mode()
             latents = latents * self.pipeline.vae.config.scaling_factor
 
-            # Кодирование текстового промпта для SDXL
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompt,
                 device=self.device,
@@ -58,13 +56,11 @@ class DDIMInverter(BaseInverter):
 
             added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
 
-        # Настройка временных шагов для обратного процесса
         self.inverse_scheduler.set_timesteps(num_steps, device=self.device)
         timesteps = self.inverse_scheduler.timesteps
 
         inverted_latents = latents.clone()
 
-        # Обратный процесс: от изображения к шуму
         with torch.no_grad():
             for t in timesteps:
                 noise_pred = self.pipeline.unet(
@@ -80,7 +76,6 @@ class DDIMInverter(BaseInverter):
                     inverted_latents
                 ).prev_sample
 
-        # DDIM не оптимизирует эмбеддинги, поэтому контекст не возвращается
         return inverted_latents, None
 
     def reconstruct(
@@ -98,8 +93,6 @@ class DDIMInverter(BaseInverter):
 
         context = kwargs.get("context", None)
 
-        # Временно подменяем шедулер пайплайна на прямой DDIM-шедулер,
-        # так как базовый метод reconstruct использует self.pipeline.scheduler.
         original_scheduler = self.pipeline.scheduler
         self.pipeline.scheduler = self.forward_scheduler
 
@@ -113,5 +106,4 @@ class DDIMInverter(BaseInverter):
             )
             return result
         finally:
-            # Восстанавливаем исходный шедулер, чтобы не повлиять на другие операции
             self.pipeline.scheduler = original_scheduler
