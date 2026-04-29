@@ -4,6 +4,7 @@ from typing import Optional, Tuple, Any
 from PIL import Image
 from diffusers import StableDiffusionXLPipeline
 
+
 class BaseInverter(ABC):
     """
     Базовый абстрактный класс для всех методов инверсии.
@@ -11,17 +12,18 @@ class BaseInverter(ABC):
 
     def __init__(self, pipeline: StableDiffusionXLPipeline):
         self.pipeline = pipeline
-        self.device = pipeline.device
-        self.dtype = pipeline.dtype
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float16
 
     @abstractmethod
     def invert(
-        self,
-        image: Image.Image,
-        prompt: str,
-        num_steps: int = 50,
-        mask: Optional[Image.Image] = None,
-        **kwargs
+            self,
+            image: Image.Image,
+            prompt: str,
+            num_steps: int = 50,
+            mask: Optional[Image.Image] = None,
+            **kwargs
     ) -> Tuple[torch.Tensor, Optional[Any]]:
         """
         Инвертирует изображение в латентный шум.
@@ -37,16 +39,20 @@ class BaseInverter(ABC):
         pass
 
     def reconstruct(
-        self,
-        latent_noise: torch.Tensor,
-        prompt: str,
-        num_steps: int = 50,
-        guidance_scale: float = 1.0,
-        **kwargs
+            self,
+            latent_noise: torch.Tensor,
+            prompt: str,
+            num_steps: int = 50,
+            guidance_scale: float = 1.0,
+            **kwargs
     ) -> Image.Image:
-        """Восстанавливает изображение из латентного шума."""
-        # Достаем контекст (например, эмбеддинги для Null-text), если он передан
+        """
+        Восстанавливает изображение из латентного шума.
+        """
+        # Явно переносим шум на правильное устройство
+        latent_noise = latent_noise.to(self.device)
         context = kwargs.get("context", None)
+
         with torch.no_grad():
             restored_image = self.pipeline(
                 prompt=prompt,
@@ -69,7 +75,6 @@ class BaseInverter(ABC):
         Единая точка входа для конвейера тестирования (Оркестратора).
         Выполняет полный цикл: инверсия оригинального изображения -> генерация с новым промптом.
         """
-        # Вызываем метод invert, передавая маску, если она есть
         invert_results = self.invert(
             image=image,
             prompt=source_prompt,
@@ -94,10 +99,14 @@ class BaseInverter(ABC):
         )
 
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
-        """Преобразует PIL Image в тензор, готовый для pipeline SDXL."""
+        """
+        Преобразует PIL Image в тензор, готовый для pipeline SDXL.
+        """
         tensor = self.pipeline.image_processor.preprocess(image)
         return tensor.to(device=self.device, dtype=self.dtype)
 
     def postprocess_image(self, image: Image.Image) -> Image.Image:
-        """Постобработка, если потребуется."""
+        """
+        Постобработка, если потребуется.
+        """
         return image
