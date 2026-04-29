@@ -117,8 +117,8 @@ class EvaluationPipeline:
                     metrics_dict = self.evaluator.calculate_metrics(
                         original=image,
                         reconstructed=edited_image,
-                        prompt_orig=source_prompt,
-                        prompt_edit=target_prompt
+                        source_prompt=source_prompt,
+                        target_prompt=target_prompt
                     )
 
                     img_filename = f"{safe_cat}_{safe_id}_{safe_meth}.png"
