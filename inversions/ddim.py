@@ -17,7 +17,6 @@ class DDIMInverter(BaseInverter):
     def __init__(self, pipeline: StableDiffusionXLPipeline):
         super().__init__(pipeline)
 
-        # Создаём копии шедулеров из конфигурации текущего пайплайна
         self.inverse_scheduler = DDIMInverseScheduler.from_config(pipeline.scheduler.config)
         self.forward_scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
 
@@ -26,6 +25,7 @@ class DDIMInverter(BaseInverter):
             image: Image.Image,
             prompt: str,
             num_steps: int = 50,
+            mask=None,  # добавляем для совместимости, не используется
             **kwargs
     ) -> Tuple[torch.Tensor, Optional[Any]]:
         """
@@ -36,9 +36,9 @@ class DDIMInverter(BaseInverter):
         image_tensor = self.preprocess_image(image)
 
         with torch.no_grad():
-            # Детерминированное кодирование VAE (берём моду распределения)
             latents = self.pipeline.vae.encode(image_tensor).latent_dist.mode()
             latents = latents * self.pipeline.vae.config.scaling_factor
+            latents = latents.to(self.device)
 
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompt,
@@ -46,6 +46,9 @@ class DDIMInverter(BaseInverter):
                 num_images_per_prompt=1,
                 do_classifier_free_guidance=False
             )
+            # Явный перенос на GPU
+            prompt_embeds = prompt_embeds.to(self.device)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
             h, w = image_tensor.shape[-2:]
             time_ids = self.pipeline._get_add_time_ids(

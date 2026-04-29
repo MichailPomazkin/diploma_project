@@ -36,8 +36,8 @@ class ImageInversionEvaluator:
             self,
             original: Image.Image,
             reconstructed: Image.Image,
-            prompt_orig: Optional[str] = None,
-            prompt_edit: Optional[str] = None
+            source_prompt: Optional[str] = None,
+            target_prompt: Optional[str] = None
     ):
         """Считает метрики для пары изображений."""
         with torch.no_grad():
@@ -59,16 +59,16 @@ class ImageInversionEvaluator:
                 "mse": mse_val
             }
 
-            if prompt_edit:
-                results["clip_tgt_recon"] = self.calculate_clip_score(reconstructed, prompt_edit)
-                results["clip_tgt_orig"] = self.calculate_clip_score(original, prompt_edit)
+            if target_prompt:
+                results["clip_tgt_recon"] = self.calculate_clip_score(reconstructed, target_prompt)
+                results["clip_tgt_orig"] = self.calculate_clip_score(original, target_prompt)
 
-            if prompt_orig:
-                results["clip_src_orig"] = self.calculate_clip_score(original, prompt_orig)
+            if source_prompt:
+                results["clip_src_orig"] = self.calculate_clip_score(original, source_prompt)
 
-            if prompt_orig and prompt_edit:
+            if source_prompt and target_prompt:
                 results["directional_clip"] = self.calculate_directional_clip(
-                    original, reconstructed, prompt_orig, prompt_edit
+                    original, reconstructed, source_prompt, target_prompt
                 )
 
         return results
@@ -81,19 +81,17 @@ class ImageInversionEvaluator:
         with torch.no_grad():
             if text is not None:
                 inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
-                # Ручное извлечение через text_model (совместимо со старыми версиями transformers)
                 text_outputs = self.clip_model.text_model(**inputs)
-                pooled = text_outputs.pooler_output  # shape (1, 768) для ViT-B/32
-                emb = self.clip_model.text_projection(pooled)  # проекция в 512
+                pooled = text_outputs.pooler_output
+                emb = self.clip_model.text_projection(pooled)
             elif image is not None:
                 inputs = self.clip_processor(images=image, return_tensors="pt").to(self.device)
                 vision_outputs = self.clip_model.vision_model(**inputs)
-                pooled = vision_outputs.pooler_output  # shape (1, 768)
-                emb = self.clip_model.visual_projection(pooled)  # проекция в 512
+                pooled = vision_outputs.pooler_output
+                emb = self.clip_model.visual_projection(pooled)
             else:
                 raise ValueError("Нужно передать либо текст, либо картинку")
 
-        # Нормализация (L2)
         emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
         return emb
 
@@ -104,12 +102,12 @@ class ImageInversionEvaluator:
         return F.cosine_similarity(img_emb, txt_emb).item()
 
     def calculate_directional_clip(self, img_orig: Image.Image, img_edit: Image.Image,
-                                   prompt_orig: str, prompt_edit: str) -> float:
+                                   source_prompt: str, target_prompt: str) -> float:
         """Directional CLIP: косинусное сходство между векторами изменений изображения и текста."""
         img_orig_emb = self.get_clip_embeddings(image=img_orig)
         img_edit_emb = self.get_clip_embeddings(image=img_edit)
-        txt_orig_emb = self.get_clip_embeddings(text=prompt_orig)
-        txt_edit_emb = self.get_clip_embeddings(text=prompt_edit)
+        txt_orig_emb = self.get_clip_embeddings(text=source_prompt)
+        txt_edit_emb = self.get_clip_embeddings(text=target_prompt)
 
         img_diff = img_edit_emb - img_orig_emb
         txt_diff = txt_edit_emb - txt_orig_emb

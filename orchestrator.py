@@ -35,13 +35,10 @@ class EvaluationPipeline:
                 ds = load_dataset(self.hf_repo, subset_name, split=split)
 
                 for idx, item in enumerate(ds):
-                    src_prompt = item.get('source_prompt', '')
-                    tgt_prompt = item.get('target_prompt', '')
+                    source_prompt = item.get('source_prompt', '')
+                    target_prompt = item.get('target_prompt', '')
                     img_id = str(item.get('id', idx))
 
-                    # Извлекаем маску из датасета. Конвертируем в ч/б ('L'), чтобы
-                    # исключить проблемы с многоканальными (RGB) масками.
-                    # Если маски в датасете нет, mask_img останется None.
                     mask_img = item.get('mask')
                     if mask_img is not None:
                         mask_img = mask_img.convert('L')
@@ -49,9 +46,9 @@ class EvaluationPipeline:
                     self.dataset.append({
                         "category": subset_name,
                         "image": item['image'].convert('RGB'),
-                        "mask": mask_img,  # Сохраняем маску в общий словарь
-                        "prompt_orig": src_prompt,
-                        "prompt_edit": tgt_prompt,
+                        "mask": mask_img,
+                        "source_prompt": source_prompt,
+                        "target_prompt": target_prompt,
                         "image_id": img_id
                     })
             except Exception as e:
@@ -71,7 +68,6 @@ class EvaluationPipeline:
         os.makedirs(os.path.join(results_dir, "errors"), exist_ok=True)
         csv_path = os.path.join(results_dir, output_csv)
 
-        # Восстановление предыдущего состояния (resume)
         processed_keys = set()
         if os.path.exists(csv_path):
             try:
@@ -87,14 +83,12 @@ class EvaluationPipeline:
             except Exception as e:
                 print(f"Ошибка чтения {csv_path}: {e}. Начинаем заново.")
 
-        # Основной цикл по датасету
         for item in tqdm(self.dataset, desc="Обработка датасета"):
             image = item['image']
-            prompt_orig = item['prompt_orig']
-            prompt_edit = item['prompt_edit']
+            source_prompt = item['source_prompt']
+            target_prompt = item['target_prompt']
             category = item['category']
             img_id = item['image_id']
-            # Извлекаем маску для текущей картинки
             mask = item.get('mask')
 
             for method_name, method_pipeline in self.methods.items():
@@ -110,12 +104,10 @@ class EvaluationPipeline:
 
                 try:
                     with PerformanceMonitor() as monitor:
-                        # Передаём маску в метод run. Базовые методы (например, DDIM),
-                        # которые не используют маску, просто проигнорируют её через **kwargs.
                         edited_image = method_pipeline.run(
                             image=image,
-                            prompt_orig=prompt_orig,
-                            prompt_edit=prompt_edit,
+                            source_prompt=source_prompt,
+                            target_prompt=target_prompt,
                             mask=mask
                         )
 
@@ -125,8 +117,8 @@ class EvaluationPipeline:
                     metrics_dict = self.evaluator.calculate_metrics(
                         original=image,
                         reconstructed=edited_image,
-                        prompt_orig=prompt_orig,
-                        prompt_edit=prompt_edit
+                        prompt_orig=source_prompt,
+                        prompt_edit=target_prompt
                     )
 
                     img_filename = f"{safe_cat}_{safe_id}_{safe_meth}.png"
@@ -168,7 +160,6 @@ class EvaluationPipeline:
                         pd.DataFrame(self.results).to_csv(csv_path, index=False)
                         processed_keys.add(run_key)
 
-                    # Освобождение памяти GPU для предотвращения OOM (Out Of Memory)
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 

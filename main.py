@@ -19,11 +19,11 @@ class InverterWrapper:
         self.inverter = inverter_instance
         self.custom_kwargs = custom_kwargs
 
-    def run(self, image, prompt_orig, prompt_edit, mask=None, **kwargs):
+    def run(self, image, source_prompt, target_prompt, mask=None, **kwargs):
         final_kwargs = {**kwargs, **self.custom_kwargs}
         if mask is not None:
             final_kwargs['mask'] = mask
-        return self.inverter.run(image, prompt_orig, prompt_edit, **final_kwargs)
+        return self.inverter.run(image, source_prompt, target_prompt, **final_kwargs)
 
 
 def parse_args():
