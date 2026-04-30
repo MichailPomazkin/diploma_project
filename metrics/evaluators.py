@@ -23,7 +23,7 @@ class ImageInversionEvaluator:
         self.lpips_metric = LPIPS(net='vgg').to(device)
 
         print("Загружаем веса CLIP...")
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True).to(device)
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True).to("cpu")
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
     def preprocess(self, pil_image: Image.Image) -> torch.Tensor:
@@ -74,10 +74,10 @@ class ImageInversionEvaluator:
         return results
 
     def get_clip_embeddings(self, image: Image.Image = None, text: str = None):
-        """
-        Извлекает нормализованные эмбеддинги для текста или картинки.
-        Возвращает тензор формы (1, embedding_dim).
-        """
+        """Извлекает нормализованные эмбеддинги."""
+        # Временно кидаем модель на GPU
+        self.clip_model.to(self.device)
+
         with torch.no_grad():
             if text is not None:
                 inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
@@ -93,6 +93,11 @@ class ImageInversionEvaluator:
                 raise ValueError("Нужно передать либо текст, либо картинку")
 
         emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+
+        # Возвращаем модель обратно на CPU, освобождая  VRAM
+        self.clip_model.to("cpu")
+        torch.cuda.empty_cache()
+
         return emb
 
     def calculate_clip_score(self, image: Image.Image, prompt: str) -> float:
