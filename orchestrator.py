@@ -3,6 +3,7 @@ import re
 import traceback
 import pandas as pd
 import torch
+import gc
 from datasets import load_dataset
 from tqdm import tqdm
 from typing import Dict, Any, List
@@ -102,6 +103,10 @@ class EvaluationPipeline:
 
                 row_data = {}
 
+                if self.device == "cuda" and torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                 try:
                     with PerformanceMonitor() as monitor:
                         edited_image = method_pipeline.run(
@@ -160,7 +165,9 @@ class EvaluationPipeline:
                         pd.DataFrame(self.results).to_csv(csv_path, index=False)
                         processed_keys.add(run_key)
 
+
                     if self.device == "cuda" and torch.cuda.is_available():
+                        gc.collect()
                         torch.cuda.empty_cache()
 
         print(f"\nПайплайн завершён. Результаты сохранены в {csv_path}")

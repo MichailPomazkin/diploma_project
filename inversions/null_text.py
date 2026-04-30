@@ -121,19 +121,18 @@ class NullTextInverter(BaseInverter):
                 optimizer.zero_grad()
                 uncond_fp16 = uncond_embeds_opt.to(dtype=prompt_embeds.dtype)
 
-                latent_input = torch.cat([current_latent] * 2)
-                latent_input = self.forward_scheduler.scale_model_input(latent_input, t)
+                latent_scaled = self.forward_scheduler.scale_model_input(current_latent, t)
 
-                embeds_input = torch.cat([uncond_fp16, prompt_embeds])
-                pooled_input = torch.cat([self.empty_pooled, pooled_prompt_embeds])
-                time_ids_input = torch.cat([time_ids, time_ids])
-
-                noise_pred = self.pipeline.unet(
-                    latent_input, t, encoder_hidden_states=embeds_input,
-                    added_cond_kwargs={"text_embeds": pooled_input, "time_ids": time_ids_input}
+                noise_pred_uncond = self.pipeline.unet(
+                    latent_scaled, t, encoder_hidden_states=uncond_fp16,
+                    added_cond_kwargs={"text_embeds": self.empty_pooled, "time_ids": time_ids}
                 ).sample
 
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                with torch.no_grad():
+                    noise_pred_text = self.pipeline.unet(
+                        latent_scaled, t, encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
+                    ).sample
                 noise_pred_cfg = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 pred_latent = self.forward_scheduler.step(noise_pred_cfg, t, current_latent).prev_sample
 
