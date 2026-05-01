@@ -7,8 +7,7 @@ import torchvision.transforms.functional as TF
 
 from diffusers import DDIMInverseScheduler, DDIMScheduler, StableDiffusionXLPipeline
 from .base_inverter import BaseInverter
-from inversions import CrossAttentionManager
-
+from .attention_utils import CrossAttentionManager
 
 class NullTextInverter(BaseInverter):
     """
