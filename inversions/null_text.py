@@ -7,6 +7,7 @@ import torchvision.transforms.functional as TF
 
 from diffusers import DDIMInverseScheduler, DDIMScheduler, StableDiffusionXLPipeline
 from .base_inverter import BaseInverter
+from inversions import CrossAttentionManager
 
 
 class NullTextInverter(BaseInverter):
@@ -28,6 +29,9 @@ class NullTextInverter(BaseInverter):
             self.empty_embeds = self.empty_embeds.to(self.device)
             self.empty_pooled = self.empty_pooled.to(self.device)
 
+        # Инициализируем наш перехватчик карт внимания
+        self.attn_manager = CrossAttentionManager(self.pipeline.unet)
+
     def invert(
             self,
             image: Image.Image,
@@ -38,12 +42,12 @@ class NullTextInverter(BaseInverter):
             learning_rate: float = 1e-3,
             use_spatial_mask: bool = False,
             mask: Optional[Image.Image] = None,
+            token_index: Optional[int] = None,
             **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
 
         if guidance_scale <= 1.0:
-            print(
-                "[Null-text] Внимание: guidance_scale <= 1.0. При таком значении инверсия точна и без оптимизации, метод излишен.")
+            print("[Null-text] Внимание: guidance_scale <= 1.0. Инверсия точна и без оптимизации, метод излишен.")
 
         print("[Null-text] Этап 1: получение эталонной DDIM-траектории...")
         image_tensor = self.preprocess_image(image)
@@ -56,7 +60,6 @@ class NullTextInverter(BaseInverter):
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
-            # Переносим на GPU только эмбеддинги
             prompt_embeds = prompt_embeds.to(self.device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
@@ -69,12 +72,11 @@ class NullTextInverter(BaseInverter):
             added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
 
         self.inverse_scheduler.set_timesteps(num_steps, device=self.device)
-
-        # ВНИМАНИЕ: Берем timesteps как есть, без .to(self.device)
         timesteps = self.inverse_scheduler.timesteps
 
         trajectory = [latents.clone()]
         current_latents = latents.clone()
+
         with torch.no_grad():
             for t in timesteps:
                 noise_pred = self.pipeline.unet(
@@ -87,11 +89,16 @@ class NullTextInverter(BaseInverter):
         trajectory = list(reversed(trajectory))
         latent_noise = trajectory[0]  # z_T
 
+        # ========== НАСТРОЙКА SCHEDULER ==========
+        print(f"[Null-text] Этап 2: градиентная оптимизация (Adam, {num_inner_steps} итераций/шаг)...")
+        self.forward_scheduler.set_timesteps(num_steps, device=self.device)
+        forward_timesteps = self.forward_scheduler.timesteps
+
+        # ========== ПОДГОТОВКА ИЛИ ГЕНЕРАЦИЯ МАСКИ ==========
         prepared_mask_latent = None
         if use_spatial_mask:
-            if mask is None:
-                print("[Null-text] Предупреждение: use_spatial_mask=True, но маска не передана. Работаем без маски.")
-            else:
+            if mask is not None:
+                # Вариант 1: Внешняя маска (картинка)
                 mask_tensor = TF.to_tensor(mask).to(self.device)
                 if mask_tensor.shape[0] > 1:
                     mask_tensor = mask_tensor[0:1]
@@ -100,14 +107,42 @@ class NullTextInverter(BaseInverter):
                 h_lat, w_lat = latent_noise.shape[-2:]
                 prepared_mask_latent = F.interpolate(mask_bg, size=(h_lat, w_lat), mode='nearest')
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
-                print("[Null-text] Маска загружена и масштабирована для латентного пространства.")
+                print("[Null-text] Внешняя маска загружена и масштабирована.")
 
-        print(f"[Null-text] Этап 2: градиентная оптимизация (Adam, {num_inner_steps} итераций/шаг)...")
-        self.forward_scheduler.set_timesteps(num_steps, device=self.device)
+            elif token_index is not None:
+                # Вариант 2: Автоматическая генерация из Cross-Attention
+                print(f"[Null-text] Генерируем маску из Cross-Attention для токена №{token_index}...")
 
-        # ВНИМАНИЕ: Берем timesteps как есть, без .to(self.device)
-        forward_timesteps = self.forward_scheduler.timesteps
+                self.attn_manager.attach()
 
+                t_dummy = forward_timesteps[0]  # Берем корректный шаг
+                latent_scaled = self.forward_scheduler.scale_model_input(latent_noise.clone(), t_dummy)
+
+                with torch.no_grad():
+                    _ = self.pipeline.unet(
+                        latent_scaled, t_dummy, encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
+                    )
+
+                h_lat, w_lat = latent_noise.shape[-2:]
+                bg_mask = self.attn_manager.get_mask_for_token(
+                    token_index=token_index,
+                    threshold=0.3,
+                    resolution=h_lat,
+                    device=self.device
+                )
+
+                self.attn_manager.detach()
+
+                prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
+                prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
+                print("[Null-text] Маска из Cross-Attention успешно сгенерирована!")
+
+            else:
+                print(
+                    "[Null-text] Предупреждение: use_spatial_mask=True, но ни mask, ни token_index не переданы! Работаем без маски.")
+
+        # ========== ЦИКЛ ОПТИМИЗАЦИИ ==========
         optimized_uncond_embeddings = []
         current_latent = latent_noise.clone().detach()
 
@@ -133,9 +168,11 @@ class NullTextInverter(BaseInverter):
                         latent_scaled, t, encoder_hidden_states=prompt_embeds,
                         added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
                     ).sample
+
                 noise_pred_cfg = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 pred_latent = self.forward_scheduler.step(noise_pred_cfg, t, current_latent).prev_sample
 
+                # Применение пространственной маски к функции потерь
                 if use_spatial_mask and prepared_mask_latent is not None:
                     diff = pred_latent.float() - target_latent.float()
                     masked_diff = diff * prepared_mask_latent
@@ -151,6 +188,7 @@ class NullTextInverter(BaseInverter):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_([uncond_embeds_opt], 1.0)
                 optimizer.step()
+
                 with torch.no_grad():
                     uncond_embeds_opt.clamp_(-10.0, 10.0)
 
@@ -189,8 +227,6 @@ class NullTextInverter(BaseInverter):
 
         try:
             self.pipeline.scheduler.set_timesteps(num_steps, device=self.device)
-
-            # ВНИМАНИЕ: Берем timesteps как есть, без .to(self.device)
             timesteps = self.pipeline.scheduler.timesteps
 
             do_classifier_free_guidance = guidance_scale > 1.0
@@ -200,7 +236,6 @@ class NullTextInverter(BaseInverter):
                     prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
                 )
 
-                # Переносим на GPU только эмбеддинги
                 prompt_embeds = prompt_embeds.to(self.device)
                 pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 

@@ -40,17 +40,40 @@ class EvaluationPipeline:
                     target_prompt = item.get('target_prompt', '')
                     img_id = str(item.get('id', idx))
 
-                    mask_img = item.get('mask')
-                    if mask_img is not None:
-                        mask_img = mask_img.convert('L')
+                    token_index = None
+                    edit_action = item.get('edit_action', {})
+                    if edit_action:
+                        try:
+                            # Вариант 1: edit_action — это список изменений (берем первое)
+                            if isinstance(edit_action, list) and len(edit_action) > 0:
+                                action_dict = edit_action[0]
+                            # Вариант 2: edit_action — это просто словарь
+                            elif isinstance(edit_action, dict):
+                                action_dict = edit_action
+                            # Вариант 3: иногда датасеты сохраняют словари как строки (JSON)
+                            elif isinstance(edit_action, str):
+                                import ast
+                                action_dict = ast.literal_eval(edit_action)
+                                if isinstance(action_dict, list):
+                                    action_dict = action_dict[0]
+                            else:
+                                action_dict = {}
+
+                            # Извлекаем тот самый "position index"
+                            # (обычно ключ называется 'position', 'position_index' или 'index')
+                            pos = action_dict.get('position', action_dict.get('position_index', None))
+                            if pos is not None:
+                                token_index = int(pos)
+                        except Exception as e:
+                            print(f"  [Оркестратор] Не удалось распарсить edit_action для {img_id}: {e}")
 
                     self.dataset.append({
                         "category": subset_name,
                         "image": item['image'].convert('RGB'),
-                        "mask": mask_img,
                         "source_prompt": source_prompt,
                         "target_prompt": target_prompt,
-                        "image_id": img_id
+                        "image_id": img_id,
+                        "token_index": token_index  # <--- Сохраняем в наш датасет!
                     })
             except Exception as e:
                 print(f"  Ошибка при загрузке {subset_name}: {e}")
@@ -90,7 +113,7 @@ class EvaluationPipeline:
             target_prompt = item['target_prompt']
             category = item['category']
             img_id = item['image_id']
-            mask = item.get('mask')
+            token_index = item.get('token_index')
 
             for method_name, method_pipeline in self.methods.items():
                 run_key = f"{category}_{img_id}_{method_name}"
@@ -113,7 +136,7 @@ class EvaluationPipeline:
                             image=image,
                             source_prompt=source_prompt,
                             target_prompt=target_prompt,
-                            mask=mask
+                            token_index=token_index
                         )
 
                     if edited_image is None:

@@ -15,16 +15,19 @@ class InverterWrapper:
     Обёртка, позволяющая передавать дополнительные аргументы (например, use_spatial_mask)
     в метод run инвертера, не меняя код оркестратора.
     """
+
     def __init__(self, inverter_instance, **custom_kwargs):
         self.inverter = inverter_instance
         self.custom_kwargs = custom_kwargs
 
-    def run(self, image, source_prompt, target_prompt, mask=None, **kwargs):
+    def run(self, image, source_prompt, target_prompt, mask=None, token_index=None, **kwargs):
         final_kwargs = {**kwargs, **self.custom_kwargs}
         if mask is not None:
             final_kwargs['mask'] = mask
-        return self.inverter.run(image, source_prompt, target_prompt, **final_kwargs)
+        if token_index is not None:
+            final_kwargs['token_index'] = token_index
 
+        return self.inverter.run(image, source_prompt, target_prompt, **final_kwargs)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Пайплайн оценки методов инверсии для SDXL.")
@@ -74,6 +77,13 @@ def main():
 
         pipe = StableDiffusionXLPipeline.from_pretrained(**pipe_kwargs).to(device)
         pipe.upcast_vae = False
+
+        if device == "cuda":
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                print("Оптимизация памяти: xformers включены.")
+            except Exception as e:
+                print(f"Внимание: не удалось включить xformers: {e}")
 
         if hasattr(pipe, "safety_checker"):
             pipe.safety_checker = None
