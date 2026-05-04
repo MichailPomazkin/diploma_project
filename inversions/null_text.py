@@ -11,6 +11,7 @@ from diffusers import DDIMInverseScheduler, DDIMScheduler, StableDiffusionXLPipe
 from .base_inverter import BaseInverter
 from .attention_utils import CrossAttentionManager
 
+
 class NullTextInverter(BaseInverter):
     """
     Null-text Inversion с поддержкой пространственного маскирования.
@@ -116,8 +117,10 @@ class NullTextInverter(BaseInverter):
 
                 self.attn_manager.attach()
 
-                t_dummy = forward_timesteps[0]  # Берем корректный шаг
-                latent_scaled = self.forward_scheduler.scale_model_input(latent_noise.clone(), t_dummy)
+                # === ИСПРАВЛЕНИЕ: Берем 10-й шаг (или последний), чтобы избежать стартового шума ===
+                step_idx = min(10, len(forward_timesteps) - 1)
+                t_dummy = forward_timesteps[step_idx]
+                latent_scaled = self.forward_scheduler.scale_model_input(trajectory[step_idx].clone(), t_dummy)
 
                 with torch.no_grad():
                     _ = self.pipeline.unet(
@@ -129,27 +132,32 @@ class NullTextInverter(BaseInverter):
                     h_lat, w_lat = latent_noise.shape[-2:]
                     bg_mask = self.attn_manager.get_mask_for_token(
                         token_index=token_index,
-                        threshold=0.3,
+                        threshold=0.15,  # Снизили порог для 10-го шага
                         resolution=h_lat,
                         device=self.device
                     )
 
-                    # === ИСПРАВЛЕНИЕ: Инверсия маски ===
-                    # Теперь фон = 1.0 (белый), объект = 0.0 (черный)
+                    # Инверсия маски: теперь фон = 1.0 (белый), объект = 0.0 (черный)
                     bg_mask = 1.0 - bg_mask
+
+                    # Создаем отдельную красивую папку прямо в памяти Colab
+                    save_dir = "/content/debug_masks"
+                    os.makedirs(save_dir, exist_ok=True)
 
                     try:
                         debug_mask = bg_mask.unsqueeze(0).cpu()
 
-                        # Сохраняем в текущую директорию Colab (можно указать явно /content/)
-                        mask_filename = f"debug_mask_token_{token_index}.png"
+                        # === ИСПРАВЛЕНИЕ: Безопасное получение image_id из kwargs ===
+                        safe_img_id = kwargs.get('image_id', 'debug')
+                        filename = f"img_{safe_img_id}_token_{token_index}.png"
+                        mask_path = os.path.join(save_dir, filename)
 
                         # Сохраняем картинку
-                        torchvision.utils.save_image(debug_mask, mask_filename)
-                        print(f"  [Отладка] Маска сохранена: {mask_filename}")
+                        torchvision.utils.save_image(debug_mask, mask_path)
+                        print(f"  [Отладка] Маска сохранена в Colab: {mask_path}")
+
                     except Exception as e:
                         print(f"  [Отладка] Ошибка записи файла маски: {e}")
-                    # ==========================================
 
                     self.attn_manager.detach()
 
@@ -167,6 +175,7 @@ class NullTextInverter(BaseInverter):
         else:
             self.spatial_mask = None
             self.original_trajectory = None
+
         # ========== ЦИКЛ ОПТИМИЗАЦИИ ==========
         optimized_uncond_embeddings = []
         current_latent = latent_noise.clone().detach()
@@ -221,14 +230,12 @@ class NullTextInverter(BaseInverter):
             optimized_uncond_embeddings.append(uncond_embeds_opt.detach().to(dtype=prompt_embeds.dtype))
 
             if pred_latent is not None:
-                # === ИСПРАВЛЕНИЕ: МАСКИРОВАННАЯ ПРОВЕРКА ТРАЕКТОРИИ ===
+                # Маскированная проверка траектории
                 if use_spatial_mask and prepared_mask_latent is not None:
-                    # Проверяем отклонение только на защищенном фоне
                     diff = pred_latent.float() - target_latent.float()
                     masked_diff = diff * prepared_mask_latent
                     mse_error = ((masked_diff ** 2).sum() / (prepared_mask_latent.sum() + 1e-8)).item()
                 else:
-                    # Оригинальная глобальная проверка
                     mse_error = F.mse_loss(pred_latent.float(), target_latent.float()).item()
 
                 if mse_error > 1.0:
@@ -313,7 +320,7 @@ class NullTextInverter(BaseInverter):
                     # СТАНДАРТНЫЙ ШАГ ШЕДУЛЕРА
                     latents = self.pipeline.scheduler.step(noise_pred, t, latents).prev_sample
 
-                    # ДОБАВЛЕНО: ПРОСТРАНСТВЕННОЕ СЛИЯНИЕ (BLENDING
+                    # ДОБАВЛЕНО: ПРОСТРАНСТВЕННОЕ СЛИЯНИЕ (BLENDING)
                     if hasattr(self, 'spatial_mask') and self.spatial_mask is not None:
                         # mask = 1.0 (Фон, защищен), mask = 0.0 (Объект, меняется)
                         target_latent = self.original_trajectory[i + 1].to(self.device)
@@ -321,7 +328,8 @@ class NullTextInverter(BaseInverter):
                         # а сгенерированный объект (мотоцикл) оставляем нетронутым
                         latents = latents * (1.0 - self.spatial_mask) + target_latent * self.spatial_mask
 
-                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[
+                    0]
                 image = self.pipeline.image_processor.postprocess(image, output_type="pil")[0]
 
             return image
