@@ -167,6 +167,12 @@ class NullTextInverter(BaseInverter):
                 print(
                     "[Null-text] Предупреждение: use_spatial_mask=True, но ни mask, ни token_index не переданы! Работаем без маски.")
 
+        if use_spatial_mask and prepared_mask_latent is not None:
+            self.spatial_mask = prepared_mask_latent.detach()
+            self.original_trajectory = [lat.detach().clone() for lat in trajectory]
+        else:
+            self.spatial_mask = None
+            self.original_trajectory = None
         # ========== ЦИКЛ ОПТИМИЗАЦИИ ==========
         optimized_uncond_embeddings = []
         current_latent = latent_noise.clone().detach()
@@ -310,10 +316,18 @@ class NullTextInverter(BaseInverter):
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                    # СТАНДАРТНЫЙ ШАГ ШЕДУЛЕРА
                     latents = self.pipeline.scheduler.step(noise_pred, t, latents).prev_sample
 
-                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[
-                    0]
+                    # ДОБАВЛЕНО: ПРОСТРАНСТВЕННОЕ СЛИЯНИЕ (BLENDING
+                    if hasattr(self, 'spatial_mask') and self.spatial_mask is not None:
+                        # mask = 1.0 (Фон, защищен), mask = 0.0 (Объект, меняется)
+                        target_latent = self.original_trajectory[i + 1].to(self.device)
+                        # впаиваем оригинальный фон из траектории,
+                        # а сгенерированный объект (мотоцикл) оставляем нетронутым
+                        latents = latents * (1.0 - self.spatial_mask) + target_latent * self.spatial_mask
+
+                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
                 image = self.pipeline.image_processor.postprocess(image, output_type="pil")[0]
 
             return image
