@@ -131,6 +131,18 @@ class NullTextInverter(BaseInverter):
                     device=self.device
                 )
 
+                import torchvision
+                try:
+                    # Приводим тензор к формату [1, H, W] и переносим в оперативную память
+                    debug_mask = bg_mask.unsqueeze(0).cpu()
+                    mask_filename = f"debug_mask_token_{token_index}.png"
+
+                    # Сохраняем тензор как PNG картинку в корневую директорию
+                    torchvision.utils.save_image(debug_mask, mask_filename)
+                    print(f"  [Отладка] Визуализация маски сохранена: {mask_filename}")
+                except Exception as e:
+                    print(f"  [Отладка] Ошибка записи файла маски: {e}")
+
                 self.attn_manager.detach()
 
                 prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
