@@ -141,18 +141,12 @@ class NullTextInverter(BaseInverter):
                     try:
                         debug_mask = bg_mask.unsqueeze(0).cpu()
 
-                        # Указываем путь к папке на вашем Google Диске
-                        drive_dir = "/content/drive/MyDrive/diploma_masks"
-
-                        # Автоматически создаем папку, если ее еще нет
-                        os.makedirs(drive_dir, exist_ok=True)
-
-                        # Формируем полный путь к файлу
-                        mask_filename = os.path.join(drive_dir, f"debug_mask_token_{token_index}.png")
+                        # Сохраняем в текущую директорию Colab (можно указать явно /content/)
+                        mask_filename = f"debug_mask_token_{token_index}.png"
 
                         # Сохраняем картинку
                         torchvision.utils.save_image(debug_mask, mask_filename)
-                        print(f"  [Отладка] Маска сохранена на Диск: {mask_filename}")
+                        print(f"  [Отладка] Маска сохранена: {mask_filename}")
                     except Exception as e:
                         print(f"  [Отладка] Ошибка записи файла маски: {e}")
                     # ==========================================
