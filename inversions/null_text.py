@@ -1,4 +1,6 @@
 import torch
+import torchvision
+import os
 import torch.nn.functional as F
 from torch.optim import Adam
 from typing import Optional, Tuple, List
@@ -123,27 +125,39 @@ class NullTextInverter(BaseInverter):
                         added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
                     )
 
-                h_lat, w_lat = latent_noise.shape[-2:]
-                bg_mask = self.attn_manager.get_mask_for_token(
-                    token_index=token_index,
-                    threshold=0.3,
-                    resolution=h_lat,
-                    device=self.device
-                )
+                    # Извлекаем исходную маску
+                    h_lat, w_lat = latent_noise.shape[-2:]
+                    bg_mask = self.attn_manager.get_mask_for_token(
+                        token_index=token_index,
+                        threshold=0.3,
+                        resolution=h_lat,
+                        device=self.device
+                    )
 
-                import torchvision
-                try:
-                    # Приводим тензор к формату [1, H, W] и переносим в оперативную память
-                    debug_mask = bg_mask.unsqueeze(0).cpu()
-                    mask_filename = f"debug_mask_token_{token_index}.png"
+                    # === ИСПРАВЛЕНИЕ: Инверсия маски ===
+                    # Теперь фон = 1.0 (белый), объект = 0.0 (черный)
+                    bg_mask = 1.0 - bg_mask
 
-                    # Сохраняем тензор как PNG картинку в корневую директорию
-                    torchvision.utils.save_image(debug_mask, mask_filename)
-                    print(f"  [Отладка] Визуализация маски сохранена: {mask_filename}")
-                except Exception as e:
-                    print(f"  [Отладка] Ошибка записи файла маски: {e}")
+                    try:
+                        debug_mask = bg_mask.unsqueeze(0).cpu()
 
-                self.attn_manager.detach()
+                        # Указываем путь к папке на вашем Google Диске
+                        drive_dir = "/content/drive/MyDrive/diploma_masks"
+
+                        # Автоматически создаем папку, если ее еще нет
+                        os.makedirs(drive_dir, exist_ok=True)
+
+                        # Формируем полный путь к файлу
+                        mask_filename = os.path.join(drive_dir, f"debug_mask_token_{token_index}.png")
+
+                        # Сохраняем картинку
+                        torchvision.utils.save_image(debug_mask, mask_filename)
+                        print(f"  [Отладка] Маска сохранена на Диск: {mask_filename}")
+                    except Exception as e:
+                        print(f"  [Отладка] Ошибка записи файла маски: {e}")
+                    # ==========================================
+
+                    self.attn_manager.detach()
 
                 prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
