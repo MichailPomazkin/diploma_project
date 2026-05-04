@@ -198,10 +198,12 @@ class NullTextInverter(BaseInverter):
                 pred_latent = self.forward_scheduler.step(noise_pred_cfg, t, current_latent).prev_sample
 
                 # Применение пространственной маски к функции потерь
+                # Применение пространственной маски к функции потерь
                 if use_spatial_mask and prepared_mask_latent is not None:
                     diff = pred_latent.float() - target_latent.float()
                     masked_diff = diff * prepared_mask_latent
-                    loss = (masked_diff ** 2).mean()
+
+                    loss = (masked_diff ** 2).sum() / (prepared_mask_latent.sum() + 1e-8)
                 else:
                     loss = F.mse_loss(pred_latent.float(), target_latent.float())
 
