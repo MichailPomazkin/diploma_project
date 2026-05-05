@@ -264,6 +264,15 @@ class NullTextInverter(BaseInverter):
 
         print("[Null-text] Восстанавливаем с использованием оптимизированного контекста...")
 
+        print(f"[DEBUG] reconstruct: hasattr spatial_mask = {hasattr(self, 'spatial_mask')}")
+        if hasattr(self, 'spatial_mask'):
+            print(f"[DEBUG] spatial_mask is None? {self.spatial_mask is None}")
+            if self.spatial_mask is not None:
+                print(
+                    f"[DEBUG] spatial_mask shape = {self.spatial_mask.shape}, mean = {self.spatial_mask.mean().item():.3f}")
+                print(
+                    f"[DEBUG] original_trajectory length = {len(self.original_trajectory) if self.original_trajectory else 0}")
+
         original_scheduler = self.pipeline.scheduler
         self.pipeline.scheduler = self.forward_scheduler
 

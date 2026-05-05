@@ -1,19 +1,20 @@
 import os
 import re
+import gc
 import traceback
 import pandas as pd
 import torch
-import gc
-from datasets import load_dataset
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from typing import Dict, Any, List
+from datasets import load_dataset
+
 from metrics.performance import PerformanceMonitor
 
 
 class EvaluationPipeline:
     """
     Оркестратор бенчмарка: загружает датасет PIE_Bench_pp, прогоняет изображения через
-    указанные методы инверсии (DDIM, Direct, Null-text), собирает метрики и сохраняет результаты.
+    указанные методы инверсии, собирает метрики и сохраняет результаты.
     """
 
     def __init__(self, methods_dict: Dict[str, Any], evaluator: Any, device: str = "cuda"):
@@ -25,47 +26,57 @@ class EvaluationPipeline:
         self.results: List[Dict[str, Any]] = []
         self.dataset: List[Dict[str, Any]] = []
 
+    def _get_target_token_index(self, method_pipeline, prompt: str, target_word: str) -> int:
+        """Внутренний метод для динамического поиска индекса токена."""
+        # Безопасно достаем pipeline SDXL из метода инверсии/обертки
+        sd_pipe = getattr(method_pipeline, 'pipeline', None)
+        if sd_pipe is None and hasattr(method_pipeline, 'inverter'):
+            sd_pipe = getattr(method_pipeline.inverter, 'pipeline', None)
+
+        if sd_pipe is None or not target_word:
+            return -1
+
+        input_ids = sd_pipe.tokenizer(
+            prompt, max_length=sd_pipe.tokenizer.model_max_length,
+            padding="max_length", truncation=True, return_tensors="pt"
+        ).input_ids[0]
+
+        tokens = sd_pipe.tokenizer.convert_ids_to_tokens(input_ids)
+
+        target_word = target_word.lower()
+        for i, token in enumerate(tokens):
+            clean_token = token.replace('</w>', '').replace('Ġ', '').lower()
+            if target_word in clean_token:
+                return i
+        return -1
+
     def load_data(self, subsets: List[str], split: str = "V1"):
-        """Загружает указанные подмножества датасета PIE_Bench_pp из Hugging Face."""
+        """Загружает указанные подмножества (если не используется test_dataset напрямую)."""
         self.dataset = []
         print(f"Загрузка данных из {self.hf_repo} (split='{split}')...")
 
         for subset_name in subsets:
             try:
-                print(f"  Категория: {subset_name}")
                 ds = load_dataset(self.hf_repo, subset_name, split=split)
-
                 for idx, item in enumerate(ds):
                     source_prompt = item.get('source_prompt', '')
                     target_prompt = item.get('target_prompt', '')
                     img_id = str(item.get('id', idx))
 
-                    token_index = None
+                    word_to_replace = None
                     edit_action = item.get('edit_action', {})
                     if edit_action:
                         try:
-                            # Вариант 1: edit_action — это список изменений (берем первое)
-                            if isinstance(edit_action, list) and len(edit_action) > 0:
-                                action_dict = edit_action[0]
-                            # Вариант 2: edit_action — это просто словарь
-                            elif isinstance(edit_action, dict):
-                                action_dict = edit_action
-                            # Вариант 3: иногда датасеты сохраняют словари как строки (JSON)
-                            elif isinstance(edit_action, str):
+                            if isinstance(edit_action, str):
                                 import ast
-                                action_dict = ast.literal_eval(edit_action)
-                                if isinstance(action_dict, list):
-                                    action_dict = action_dict[0]
-                            else:
-                                action_dict = {}
+                                edit_action = ast.literal_eval(edit_action)
 
-                            # Извлекаем тот самый "position index"
-                            # (обычно ключ называется 'position', 'position_index' или 'index')
-                            pos = action_dict.get('position', action_dict.get('position_index', None))
-                            if pos is not None:
-                                token_index = int(pos)
+                            if isinstance(edit_action, dict):
+                                target_key = list(edit_action.keys())[0]
+                                if isinstance(edit_action[target_key], dict):
+                                    word_to_replace = str(edit_action[target_key].get('action'))
                         except Exception as e:
-                            print(f"  [Оркестратор] Не удалось распарсить edit_action для {img_id}: {e}")
+                            print(f"  [Оркестратор] Не удалось распарсить edit_action: {e}")
 
                     self.dataset.append({
                         "category": subset_name,
@@ -73,12 +84,10 @@ class EvaluationPipeline:
                         "source_prompt": source_prompt,
                         "target_prompt": target_prompt,
                         "image_id": img_id,
-                        "token_index": token_index  # <--- Сохраняем в наш датасет!
+                        "word_to_replace": word_to_replace  # Сохраняем слово!
                     })
             except Exception as e:
                 print(f"  Ошибка при загрузке {subset_name}: {e}")
-
-        print(f"Загружено изображений: {len(self.dataset)}")
 
     def _sanitize_filename(self, name: str) -> str:
         """Заменяет недопустимые символы на '_' для безопасного имени файла."""
@@ -113,7 +122,9 @@ class EvaluationPipeline:
             target_prompt = item['target_prompt']
             category = item['category']
             img_id = item['image_id']
-            token_index = item.get('token_index')
+
+            # Извлекаем наше слово из Ячейки 3
+            word_to_replace = item.get('word_to_replace')
 
             for method_name, method_pipeline in self.methods.items():
                 run_key = f"{category}_{img_id}_{method_name}"
@@ -131,12 +142,23 @@ class EvaluationPipeline:
                     torch.cuda.empty_cache()
 
                 try:
+                    correct_token_index = -1
+                    if word_to_replace:
+                        correct_token_index = self._get_target_token_index(method_pipeline, source_prompt,
+                                                                           word_to_replace)
+                    elif item.get('token_index') is not None:  # Безопасный фолбэк
+                        correct_token_index = item['token_index']
+
+                    # === ИСПРАВЛЕНИЕ 2: Отладочный вывод ===
+                    print(f"\n  [DEBUG] Метод: {method_name} | Ищем: '{word_to_replace}' | Индекс: {correct_token_index}")
+
                     with PerformanceMonitor() as monitor:
                         edited_image = method_pipeline.run(
                             image=image,
                             source_prompt=source_prompt,
                             target_prompt=target_prompt,
-                            token_index=token_index
+                            token_index=correct_token_index,  # Передаем 100% точный индекс
+                            image_id=img_id  # Передаем ID для маски
                         )
 
                     if edited_image is None:
@@ -187,7 +209,6 @@ class EvaluationPipeline:
                         self.results.append(row_data)
                         pd.DataFrame(self.results).to_csv(csv_path, index=False)
                         processed_keys.add(run_key)
-
 
                     if self.device == "cuda" and torch.cuda.is_available():
                         gc.collect()
