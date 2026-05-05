@@ -111,14 +111,42 @@ class NullTextInverter(BaseInverter):
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
                 print("[Null-text] Внешняя маска загружена и масштабирована.")
 
-            elif token_index is not None:
-                # Вариант 2: Автоматическая генерация из Cross-Attention
-                print(f"[Null-text] Генерируем маску из Cross-Attention для токена №{token_index}...")
 
+            elif token_index is not None:
+                print(f"[Null-text] Генерируем маску из Cross-Attention для токена №{token_index}...")
                 self.attn_manager.attach()
 
-                # === ИСПРАВЛЕНИЕ: Берем 10-й шаг (или последний), чтобы избежать стартового шума ===
-                step_idx = min(10, len(forward_timesteps) - 1)
+                for step_idx in [25, 35]:
+                    t_dummy = forward_timesteps[min(step_idx, len(forward_timesteps) - 1)]
+                    latent_scaled = self.forward_scheduler.scale_model_input(trajectory[step_idx].clone(), t_dummy)
+
+                    with torch.no_grad():
+                        _ = self.pipeline.unet(
+                            latent_scaled, t_dummy, encoder_hidden_states=prompt_embeds,
+                            added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
+                        )
+                        h_lat, w_lat = latent_noise.shape[-2:]
+                        save_dir = f"/content/debug_masks_step{step_idx}"
+                        os.makedirs(save_dir, exist_ok=True)
+                        safe_img_id = kwargs.get('image_id', 'debug')
+                        for t_idx in range(15):
+                            temp_mask = self.attn_manager.get_mask_for_token(
+                                token_index=t_idx, threshold=0.15, resolution=h_lat, device=self.device
+                            )
+
+                            # Оставляем как есть: объект будет белым
+                            torchvision.utils.save_image(temp_mask.unsqueeze(0).cpu(),
+                                                         os.path.join(save_dir, f"img_{safe_img_id}_TOKEN_{t_idx}.png"))
+
+                    # Очищаем память карт внимания для следующего шага
+                    if hasattr(self.attn_manager, 'attentions') and isinstance(self.attn_manager.attentions, dict):
+                        self.attn_manager.attentions.clear()
+                    elif hasattr(self.attn_manager, 'reset'):
+                        self.attn_manager.reset()
+
+                # 2. ВОЗВРАТ К БОЕВОМУ АЛГОРИТМУ (ЧТОБЫ КОД ПОШЕЛ ДАЛЬШЕ)
+                # Берем 25-й шаг как основной для рабочей маски
+                step_idx = min(25, len(forward_timesteps) - 1)
                 t_dummy = forward_timesteps[step_idx]
                 latent_scaled = self.forward_scheduler.scale_model_input(trajectory[step_idx].clone(), t_dummy)
 
@@ -128,46 +156,21 @@ class NullTextInverter(BaseInverter):
                         added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
                     )
 
-                    # Извлекаем исходную маску
                     h_lat, w_lat = latent_noise.shape[-2:]
+
                     bg_mask = self.attn_manager.get_mask_for_token(
                         token_index=token_index,
-                        threshold=0.15,  # Снизили порог для 10-го шага
+                        threshold=0.15,
                         resolution=h_lat,
                         device=self.device
                     )
-
-                    # Инверсия маски: теперь фон = 1.0 (белый), объект = 0.0 (черный)
+                    # Инверсия для алгоритма: фон = 1.0 (белый), объект = 0.0 (черный)
                     bg_mask = 1.0 - bg_mask
-
-                    # Создаем отдельную красивую папку прямо в памяти Colab
-                    save_dir = "/content/debug_masks"
-                    os.makedirs(save_dir, exist_ok=True)
-
-                    try:
-                        debug_mask = bg_mask.unsqueeze(0).cpu()
-
-                        # === ИСПРАВЛЕНИЕ: Безопасное получение image_id из kwargs ===
-                        safe_img_id = kwargs.get('image_id', 'debug')
-                        filename = f"img_{safe_img_id}_token_{token_index}.png"
-                        mask_path = os.path.join(save_dir, filename)
-
-                        # Сохраняем картинку
-                        torchvision.utils.save_image(debug_mask, mask_path)
-                        print(f"  [Отладка] Маска сохранена в Colab: {mask_path}")
-
-                    except Exception as e:
-                        print(f"  [Отладка] Ошибка записи файла маски: {e}")
-
-                    self.attn_manager.detach()
+                self.attn_manager.detach()
 
                 prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
-                print("[Null-text] Маска из Cross-Attention успешно сгенерирована!")
-
-            else:
-                print(
-                    "[Null-text] Предупреждение: use_spatial_mask=True, но ни mask, ни token_index не переданы! Работаем без маски.")
+                print("[Null-text] Отладка завершена, боевая маска с 25-го шага успешно сгенерирована!")
 
         if use_spatial_mask and prepared_mask_latent is not None:
             self.spatial_mask = prepared_mask_latent.detach()
