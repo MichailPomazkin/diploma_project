@@ -108,11 +108,10 @@ class NullTextInverter(BaseInverter):
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
                 print("[Null-text] Внешняя маска загружена и масштабирована.")
 
-            elif token_index is not None:
+            elif token_index is not None and token_index != -1:
                 print(f"[Null-text] Генерируем маску из Cross-Attention для токена №{token_index} на 25-м шаге...")
                 self.attn_manager.attach()
 
-                # Берем только 25-й шаг (золотая середина)
                 step_idx = min(25, len(forward_timesteps) - 1)
                 t_dummy = forward_timesteps[step_idx]
                 latent_scaled = self.forward_scheduler.scale_model_input(trajectory[step_idx].clone(), t_dummy)
@@ -124,45 +123,64 @@ class NullTextInverter(BaseInverter):
                     )
                     h_lat, w_lat = latent_noise.shape[-2:]
 
-                    # Достаем ТОЛЬКО наш правильный токен
                     raw_mask = self.attn_manager.get_mask_for_token(
                         token_index=token_index, threshold=0.15, resolution=h_lat, device=self.device
                     )
 
-                    # --- ОЧИСТКА ОТ МУСОРА (Connected Component Analysis) ---
-                    mask_np = raw_mask.cpu().numpy() > 0.5
-                    labeled_mask, num_features = ndimage.label(mask_np)
+                    # --- ИСПРАВЛЕННАЯ ОЧИСТКА МАСКИ ---
+                    # 1. Ищем черные пиксели (объект)
+                    object_pixels = raw_mask.cpu().numpy() < 0.5
 
-                    if num_features > 1:
-                        sizes = ndimage.sum(mask_np, labeled_mask, range(1, num_features + 1))
+                    # 2. Раздуваем (Dilation) для склейки разрывов
+                    object_pixels = ndimage.binary_dilation(object_pixels, iterations=2)
+
+                    # 3. Ищем самый большой компонент
+                    labeled_mask, num_features = ndimage.label(object_pixels)
+                    if num_features > 0:
+                        sizes = ndimage.sum(object_pixels, labeled_mask, range(1, num_features + 1))
                         largest_label = np.argmax(sizes) + 1
-                        clean_mask_np = (labeled_mask == largest_label).astype(np.float32)
+                        clean_object = (labeled_mask == largest_label)
                     else:
-                        clean_mask_np = mask_np.astype(np.float32)
+                        clean_object = object_pixels
 
-                    # Сохраняем ТОЛЬКО итоговую боевую маску для диплома
-                    save_dir = "/content/debug_masks_final"
-                    os.makedirs(save_dir, exist_ok=True)
-                    safe_img_id = kwargs.get('image_id', 'debug')
+                    # 4. Заливаем дырки внутри машины/объекта
+                    clean_object = ndimage.binary_fill_holes(clean_object).astype(np.float32)
 
-                    clean_mask_tensor = torch.from_numpy(clean_mask_np)
-                    torchvision.utils.save_image(
-                        clean_mask_tensor.unsqueeze(0).cpu(),
-                        os.path.join(save_dir, f"img_{safe_img_id}_MASK.png")
-                    )
+                    # 5. Проверяем покрытие (защита от "черного квадрата" на цветах)
+                    coverage = clean_object.mean()
+                    print(f"  [Отладка] Покрытие объекта: {coverage * 100:.1f}%")
 
-                    # Формируем маску для алгоритма (1.0 = фон, 0.0 = объект)
-                    bg_mask = clean_mask_tensor.to(self.device)
-                    bg_mask = 1.0 - bg_mask
+                    if coverage > 0.8:
+                        print("  [ВНИМАНИЕ] Объект занял весь экран. Отключаем маску.")
+                        use_spatial_mask = False
+                        prepared_mask_latent = None
+                    else:
+                        # 6. Формируем итоговую маску (Фон = 1.0, Объект = 0.0)
+                        bg_mask_np = 1.0 - clean_object
+                        clean_mask_tensor = torch.from_numpy(bg_mask_np).to(self.device)
+
+                        save_dir = "/content/debug_masks_final"
+                        os.makedirs(save_dir, exist_ok=True)
+                        safe_img_id = kwargs.get('image_id', 'debug')
+
+                        torchvision.utils.save_image(
+                            clean_mask_tensor.unsqueeze(0).cpu(),
+                            os.path.join(save_dir, f"img_{safe_img_id}_MASK.png")
+                        )
+
+                        bg_mask = clean_mask_tensor
 
                 self.attn_manager.detach()
 
-                prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
-                prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
-                print("[Null-text] Очищенная боевая маска успешно сгенерирована!")
+                if use_spatial_mask:
+                    prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
+                    prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
+                    print("[Null-text] Очищенная боевая маска успешно сгенерирована!")
 
             else:
-                print("[Null-text] Предупреждение: use_spatial_mask=True, но ни mask, ни token_index не переданы!")
+                print(f"[Null-text] Неверный токен (index: {token_index}). Маска отключена.")
+                use_spatial_mask = False
+                prepared_mask_latent = None
 
         if use_spatial_mask and prepared_mask_latent is not None:
             # ИСПРАВЛЕНИЕ ТИПОВ ДАННЫХ
@@ -203,7 +221,6 @@ class NullTextInverter(BaseInverter):
 
                 if use_spatial_mask and prepared_mask_latent is not None:
                     diff = pred_latent.float() - target_latent.float()
-                    # Здесь используем float32 версию маски для расчета потерь
                     mask_float = prepared_mask_latent.float()
                     masked_diff = diff * mask_float
                     loss = (masked_diff ** 2).sum() / (mask_float.sum() + 1e-8)
