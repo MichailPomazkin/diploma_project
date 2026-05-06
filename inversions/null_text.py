@@ -6,22 +6,23 @@ from torch.optim import Adam
 from typing import Optional, Tuple, List
 from PIL import Image
 import torchvision.transforms.functional as TF
+import torchvision.transforms as T
 import numpy as np
-from scipy import ndimage
 
 from diffusers import DDIMInverseScheduler, DDIMScheduler, StableDiffusionXLPipeline
 from .base_inverter import BaseInverter
-from .attention_utils import CrossAttentionManager
 
 
 class NullTextInverter(BaseInverter):
     """
-    Null-text Inversion с поддержкой пространственного маскирования.
-    Оптимизирует unconditional эмбеддинги, чтобы при высоком CFG сохранять фон.
+    Null-text Inversion с поддержкой внешней пространственной маски.
+    Реализует мягкое смешивание (soft blending) и временное управление маской
+    для бесшовной интеграции редактируемого объекта.
     """
 
     def __init__(self, pipeline: StableDiffusionXLPipeline):
         super().__init__(pipeline)
+        # Шедулеры для инверсии и генерации (независимые копии)
         self.inverse_scheduler = DDIMInverseScheduler.from_config(self.pipeline.scheduler.config)
         self.forward_scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config)
 
@@ -29,10 +30,9 @@ class NullTextInverter(BaseInverter):
             self.empty_embeds, _, self.empty_pooled, _ = self.pipeline.encode_prompt(
                 prompt="", device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
+            # Эмбеддинги пустого промпта – будут оптимизироваться
             self.empty_embeds = self.empty_embeds.to(self.device)
             self.empty_pooled = self.empty_pooled.to(self.device)
-
-        self.attn_manager = CrossAttentionManager(self.pipeline.unet)
 
     def invert(
             self,
@@ -44,27 +44,33 @@ class NullTextInverter(BaseInverter):
             learning_rate: float = 1e-3,
             use_spatial_mask: bool = False,
             mask: Optional[Image.Image] = None,
-            token_index: Optional[int] = None,
             **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-
+        """
+        Инверсия: получение эталонной траектории и оптимизация unconditional эмбеддингов.
+        Если передана внешняя маска, она используется для взвешивания функции потерь.
+        """
         if guidance_scale <= 1.0:
-            print("[Null-text] Внимание: guidance_scale <= 1.0. Инверсия точна и без оптимизации, метод излишен.")
+            print("[Null-text] guidance_scale <= 1.0 – оптимизация бессмысленна.")
 
+        # ---- Этап 1: опорная DDIM-траектория (инверсия) ----
         print("[Null-text] Этап 1: получение эталонной DDIM-траектории...")
         image_tensor = self.preprocess_image(image)
 
         with torch.no_grad():
+            # Детерминированное кодирование VAE
             latents = self.pipeline.vae.encode(image_tensor).latent_dist.mode()
             latents = latents * self.pipeline.vae.config.scaling_factor
             latents = latents.to(self.device)
 
+            # Кодирование промпта (без CFG, только для инверсии)
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
             prompt_embeds = prompt_embeds.to(self.device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
+            # time_ids – дополнительные параметры для SDXL (размеры, кроп)
             h, w = image_tensor.shape[-2:]
             time_ids = self.pipeline._get_add_time_ids(
                 (h, w), (0, 0), (h, w), dtype=prompt_embeds.dtype,
@@ -73,6 +79,7 @@ class NullTextInverter(BaseInverter):
 
             added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
 
+        # Инверсия: шаг за шагом от чистого латента к шуму
         self.inverse_scheduler.set_timesteps(num_steps, device=self.device)
         timesteps = self.inverse_scheduler.timesteps
 
@@ -88,113 +95,49 @@ class NullTextInverter(BaseInverter):
                 current_latents = self.inverse_scheduler.step(noise_pred, t, current_latents).prev_sample
                 trajectory.append(current_latents.clone())
 
+        # Переворачиваем: теперь trajectory[0] = z_T (шум), trajectory[-1] = z_0 (оригинал)
         trajectory = list(reversed(trajectory))
         latent_noise = trajectory[0]
 
+        # ---- Этап 2: подготовка маски и оптимизация unconditional эмбеддингов ----
         print(f"[Null-text] Этап 2: градиентная оптимизация (Adam, {num_inner_steps} итераций/шаг)...")
         self.forward_scheduler.set_timesteps(num_steps, device=self.device)
         forward_timesteps = self.forward_scheduler.timesteps
 
+        # Подготовка маски в латентном пространстве
         prepared_mask_latent = None
         if use_spatial_mask:
             if mask is not None:
+                # Преобразуем PIL-маску в тензор
                 mask_tensor = TF.to_tensor(mask).to(self.device)
+                # Оставляем один канал
                 if mask_tensor.shape[0] > 1:
                     mask_tensor = mask_tensor[0:1]
+                # Инвертируем: фон = 1 (защищён), объект = 0 (меняем)
                 mask_bg = 1.0 - mask_tensor
-                mask_bg = mask_bg.unsqueeze(0)
+                mask_bg = mask_bg.unsqueeze(0)              # добавляем размерность батча
                 h_lat, w_lat = latent_noise.shape[-2:]
                 prepared_mask_latent = F.interpolate(mask_bg, size=(h_lat, w_lat), mode='nearest')
                 prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
-                print("[Null-text] Внешняя маска загружена и масштабирована.")
-
-            elif token_index is not None and token_index != -1:
-                print(f"[Null-text] Генерируем маску из Cross-Attention для токена №{token_index} на 25-м шаге...")
-                self.attn_manager.attach()
-
-                step_idx = min(25, len(forward_timesteps) - 1)
-                t_dummy = forward_timesteps[step_idx]
-                latent_scaled = self.forward_scheduler.scale_model_input(trajectory[step_idx].clone(), t_dummy)
-
-                with torch.no_grad():
-                    _ = self.pipeline.unet(
-                        latent_scaled, t_dummy, encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
-                    )
-                    h_lat, w_lat = latent_noise.shape[-2:]
-
-                    raw_mask = self.attn_manager.get_mask_for_token(
-                        token_index=token_index, threshold=0.15, resolution=h_lat, device=self.device
-                    )
-
-                    # --- ИСПРАВЛЕННАЯ ОЧИСТКА МАСКИ ---
-                    # 1. Ищем черные пиксели (объект)
-                    object_pixels = raw_mask.cpu().numpy() < 0.5
-
-                    # 2. Раздуваем (Dilation) для склейки разрывов
-                    object_pixels = ndimage.binary_dilation(object_pixels, iterations=2)
-
-                    # 3. Ищем самый большой компонент
-                    labeled_mask, num_features = ndimage.label(object_pixels)
-                    if num_features > 0:
-                        sizes = ndimage.sum(object_pixels, labeled_mask, range(1, num_features + 1))
-                        largest_label = np.argmax(sizes) + 1
-                        clean_object = (labeled_mask == largest_label)
-                    else:
-                        clean_object = object_pixels
-
-                    # 4. Заливаем дырки внутри машины/объекта
-                    clean_object = ndimage.binary_fill_holes(clean_object).astype(np.float32)
-
-                    # 5. Проверяем покрытие (защита от "черного квадрата" на цветах)
-                    coverage = clean_object.mean()
-                    print(f"  [Отладка] Покрытие объекта: {coverage * 100:.1f}%")
-
-                    if coverage > 0.8:
-                        print("  [ВНИМАНИЕ] Объект занял весь экран. Отключаем маску.")
-                        use_spatial_mask = False
-                        prepared_mask_latent = None
-                    else:
-                        # 6. Формируем итоговую маску (Фон = 1.0, Объект = 0.0)
-                        bg_mask_np = 1.0 - clean_object
-                        clean_mask_tensor = torch.from_numpy(bg_mask_np).to(self.device)
-
-                        save_dir = "/content/debug_masks_final"
-                        os.makedirs(save_dir, exist_ok=True)
-                        safe_img_id = kwargs.get('image_id', 'debug')
-
-                        torchvision.utils.save_image(
-                            clean_mask_tensor.unsqueeze(0).cpu(),
-                            os.path.join(save_dir, f"img_{safe_img_id}_MASK.png")
-                        )
-
-                        bg_mask = clean_mask_tensor
-
-                self.attn_manager.detach()
-
-                if use_spatial_mask:
-                    prepared_mask_latent = bg_mask.unsqueeze(0).unsqueeze(0)
-                    prepared_mask_latent = prepared_mask_latent.expand(-1, latent_noise.shape[1], -1, -1)
-                    print("[Null-text] Очищенная боевая маска успешно сгенерирована!")
-
+                print("[Null-text] Внешняя маска загружена и подготовлена.")
             else:
-                print(f"[Null-text] Неверный токен (index: {token_index}). Маска отключена.")
+                print("[Null-text] use_spatial_mask=True, но маска не передана. Работаем глобально.")
                 use_spatial_mask = False
-                prepared_mask_latent = None
 
+        # Сохраняем маску и траекторию для использования в реконструкции
         if use_spatial_mask and prepared_mask_latent is not None:
-            # ИСПРАВЛЕНИЕ ТИПОВ ДАННЫХ
             self.spatial_mask = prepared_mask_latent.detach().to(latent_noise.dtype)
             self.original_trajectory = [lat.detach().clone().to(latent_noise.dtype) for lat in trajectory]
         else:
             self.spatial_mask = None
             self.original_trajectory = None
 
+        # Цикл оптимизации unconditional эмбеддингов
         optimized_uncond_embeddings = []
         current_latent = latent_noise.clone().detach()
 
         for i, t in enumerate(forward_timesteps):
-            target_latent = trajectory[i + 1].detach()
+            target_latent = trajectory[i + 1].detach()   # целевой латент (из эталонной траектории)
             uncond_embeds_opt = self.empty_embeds.clone().detach().to(torch.float32).requires_grad_(True)
             optimizer = Adam([uncond_embeds_opt], lr=learning_rate)
             pred_latent = None
@@ -203,6 +146,7 @@ class NullTextInverter(BaseInverter):
                 optimizer.zero_grad()
                 uncond_fp16 = uncond_embeds_opt.to(dtype=prompt_embeds.dtype)
 
+                # Шум предсказывается дважды: для unconditional и для conditional веток
                 latent_scaled = self.forward_scheduler.scale_model_input(current_latent, t)
 
                 noise_pred_uncond = self.pipeline.unet(
@@ -216,17 +160,21 @@ class NullTextInverter(BaseInverter):
                         added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
                     ).sample
 
+                # CFG: комбинация условной и безусловной веток
                 noise_pred_cfg = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 pred_latent = self.forward_scheduler.step(noise_pred_cfg, t, current_latent).prev_sample
 
+                # Функция потерь: если есть маска, штрафуем только фоновые пиксели
                 if use_spatial_mask and prepared_mask_latent is not None:
                     diff = pred_latent.float() - target_latent.float()
                     mask_float = prepared_mask_latent.float()
                     masked_diff = diff * mask_float
+                    # Суммируем ошибку и нормируем на площадь маски (чтобы градиент не зависел от размера маски)
                     loss = (masked_diff ** 2).sum() / (mask_float.sum() + 1e-8)
                 else:
                     loss = F.mse_loss(pred_latent.float(), target_latent.float())
 
+                # Защита от численной нестабильности
                 if torch.isnan(loss) or torch.isnan(pred_latent).any() or torch.isinf(pred_latent).any():
                     print(f"  [Null-text] NaN/Inf на шаге {i}, итерация {inner_step}. Прерываем оптимизацию.")
                     pred_latent = target_latent
@@ -237,10 +185,11 @@ class NullTextInverter(BaseInverter):
                 optimizer.step()
 
                 with torch.no_grad():
-                    uncond_embeds_opt.clamp_(-10.0, 10.0)
+                    uncond_embeds_opt.clamp_(-10.0, 10.0)   # ограничиваем значения эмбеддингов
 
             optimized_uncond_embeddings.append(uncond_embeds_opt.detach().to(dtype=prompt_embeds.dtype))
 
+            # Обновление current_latent: используем предсказанный, если ошибка не слишком велика
             if pred_latent is not None:
                 if use_spatial_mask and prepared_mask_latent is not None:
                     diff = pred_latent.float() - target_latent.float()
@@ -268,9 +217,13 @@ class NullTextInverter(BaseInverter):
             context: Optional[List[torch.Tensor]] = None,
             **kwargs
     ) -> Image.Image:
-
+        """
+        Генерация (реконструкция) из инвертированного шума с использованием
+        оптимизированных unconditional эмбеддингов. Если доступна маска,
+        применяется мягкое смешивание (soft blending) и временное отключение маски.
+        """
         if context is None:
-            print("[Null-text] Внимание: контекст не передан, выполняется обычный цикл генерации.")
+            print("[Null-text] Контекст не передан – выполняем обычную DDIM-генерацию.")
         elif len(context) != num_steps:
             raise ValueError(f"Длина контекста ({len(context)}) должна равняться num_steps ({num_steps})")
 
@@ -282,17 +235,16 @@ class NullTextInverter(BaseInverter):
         try:
             self.pipeline.scheduler.set_timesteps(num_steps, device=self.device)
             timesteps = self.pipeline.scheduler.timesteps
-
-            do_classifier_free_guidance = guidance_scale > 1.0
+            do_cfg = guidance_scale > 1.0
 
             with torch.no_grad():
                 prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                     prompt=prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
                 )
-
                 prompt_embeds = prompt_embeds.to(self.device)
                 pooled_prompt_embeds = pooled_prompt_embeds.to(self.device)
 
+                # time_ids для целевого изображения
                 vae_scale_factor = getattr(self.pipeline, "vae_scale_factor", 8)
                 h, w = latent_noise.shape[-2] * vae_scale_factor, latent_noise.shape[-1] * vae_scale_factor
                 time_ids = self.pipeline._get_add_time_ids(
@@ -302,16 +254,27 @@ class NullTextInverter(BaseInverter):
 
                 latents = latent_noise.clone()
 
+                # ---- Подготовка мягкой маски (Gaussian Blur) ----
+                soft_mask = None
+                if hasattr(self, 'spatial_mask') and self.spatial_mask is not None:
+                    # Размытие маски для сглаживания границ
+                    blur = T.GaussianBlur(kernel_size=(5, 5), sigma=(2.0, 2.0))
+                    soft_mask = blur(self.spatial_mask.float())
+
+                # Шаг, после которого маска отключается (первые 80% шагов – привязка фона,
+                # последующие – свободная детализация)
+                cutoff_step = int(num_steps * 0.8)
+
                 for i, t in enumerate(timesteps):
                     uncond_emb = context[i] if context else self.empty_embeds
 
-                    if do_classifier_free_guidance:
+                    if do_cfg:
                         latent_input = torch.cat([latents] * 2)
                     else:
                         latent_input = latents
                     latent_input = self.pipeline.scheduler.scale_model_input(latent_input, t)
 
-                    if do_classifier_free_guidance:
+                    if do_cfg:
                         embeds_input = torch.cat([uncond_emb, prompt_embeds])
                         pooled_input = torch.cat([self.empty_pooled, pooled_prompt_embeds])
                         time_ids_input = torch.cat([time_ids, time_ids])
@@ -325,20 +288,25 @@ class NullTextInverter(BaseInverter):
                         added_cond_kwargs={"text_embeds": pooled_input, "time_ids": time_ids_input}
                     ).sample
 
-                    if do_classifier_free_guidance:
+                    if do_cfg:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     latents = self.pipeline.scheduler.step(noise_pred, t, latents).prev_sample
 
-                    # ИСПРАВЛЕНИЕ ТИПОВ ДАННЫХ ПРИ СЛИЯНИИ
-                    if hasattr(self, 'spatial_mask') and self.spatial_mask is not None:
-                        target_latent = self.original_trajectory[i + 1].to(device=self.device, dtype=latents.dtype)
-                        mask = self.spatial_mask.to(device=self.device, dtype=latents.dtype)
-                        latents = latents * (1.0 - mask) + target_latent * mask
+                    # ---- Time-Aware Soft Blending ----
+                    if soft_mask is not None:
+                        if i < cutoff_step:
+                            # Первые 80% шагов: фон принудительно берём из оригинальной траектории,
+                            # объект – из текущей генерации, граница смягчена размытой маской.
+                            target_latent = self.original_trajectory[i + 1].to(device=self.device, dtype=latents.dtype)
+                            mask_dt = soft_mask.to(device=self.device, dtype=latents.dtype)
+                            latents = latents * (1.0 - mask_dt) + target_latent * mask_dt
+                        elif i == cutoff_step:
+                            print("  [Null-text] Soft Blending: маска отключена, дорисовка деталей и сшивка.")
 
-                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[
-                    0]
+                # Декодирование латентов в изображение
+                image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
                 image = self.pipeline.image_processor.postprocess(image, output_type="pil")[0]
 
             return image

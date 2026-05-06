@@ -4,17 +4,22 @@ import gc
 import traceback
 import pandas as pd
 import torch
+import numpy as np
 from tqdm.auto import tqdm
 from typing import Dict, Any, List
+from PIL import Image
 from datasets import load_dataset
+
+# Импортируем CLIPSeg
+from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 from metrics.performance import PerformanceMonitor
 
 
 class EvaluationPipeline:
     """
-    Оркестратор бенчмарка: загружает датасет PIE_Bench_pp, прогоняет изображения через
-    указанные методы инверсии, собирает метрики и сохраняет результаты.
+    Оркестратор бенчмарка: загружает датасет PIE_Bench_pp, генерирует внешние маски (CLIPSeg),
+    прогоняет изображения через методы инверсии, собирает метрики и сохраняет результаты.
     """
 
     def __init__(self, methods_dict: Dict[str, Any], evaluator: Any, device: str = "cuda"):
@@ -26,32 +31,28 @@ class EvaluationPipeline:
         self.results: List[Dict[str, Any]] = []
         self.dataset: List[Dict[str, Any]] = []
 
-    def _get_target_token_index(self, method_pipeline, prompt: str, target_word: str) -> int:
-        """Внутренний метод для динамического поиска индекса токена."""
-        # Безопасно достаем pipeline SDXL из метода инверсии/обертки
-        sd_pipe = getattr(method_pipeline, 'pipeline', None)
-        if sd_pipe is None and hasattr(method_pipeline, 'inverter'):
-            sd_pipe = getattr(method_pipeline.inverter, 'pipeline', None)
+        # --- ИНИЦИАЛИЗАЦИЯ CLIPSeg ---
+        print("[Оркестратор] Загрузка модели CLIPSeg для точной сегментации...")
+        self.clipseg_processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+        self.clipseg_model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(self.device)
+        print("[Оркестратор] CLIPSeg готов!")
 
-        if sd_pipe is None or not target_word:
-            return -1
+    def _get_clipseg_mask(self, image: Image.Image, text: str, threshold: float = 0.4) -> Image.Image:
+        """Внутренний метод генерации маски по слову с помощью CLIPSeg."""
+        inputs = self.clipseg_processor(text=[text], images=[image], padding=True, return_tensors="pt").to(self.device)
 
-        input_ids = sd_pipe.tokenizer(
-            prompt, max_length=sd_pipe.tokenizer.model_max_length,
-            padding="max_length", truncation=True, return_tensors="pt"
-        ).input_ids[0]
+        with torch.no_grad():
+            outputs = self.clipseg_model(**inputs)
 
-        tokens = sd_pipe.tokenizer.convert_ids_to_tokens(input_ids)
+        # Преобразуем логиты в вероятности (Sigmoid)
+        probs = torch.sigmoid(outputs.logits.squeeze()).cpu().numpy()
 
-        target_word = target_word.lower()
-        for i, token in enumerate(tokens):
-            clean_token = token.replace('</w>', '').replace('Ġ', '').lower()
-            if target_word in clean_token:
-                return i
-        return -1
+        # Создаем бинарную маску
+        mask_np = (probs > threshold).astype(np.uint8) * 255
+        return Image.fromarray(mask_np, mode='L')
 
     def load_data(self, subsets: List[str], split: str = "V1"):
-        """Загружает указанные подмножества (если не используется test_dataset напрямую)."""
+        """Загружает указанные подмножества и парсит слова для редактирования."""
         self.dataset = []
         print(f"Загрузка данных из {self.hf_repo} (split='{split}')...")
 
@@ -65,16 +66,27 @@ class EvaluationPipeline:
 
                     word_to_replace = None
                     edit_action = item.get('edit_action', {})
+
                     if edit_action:
                         try:
                             if isinstance(edit_action, str):
                                 import ast
                                 edit_action = ast.literal_eval(edit_action)
 
+                            # --- ИСПРАВЛЕННЫЙ ПАРСЕР (Поддерживает и Change, и Delete) ---
                             if isinstance(edit_action, dict):
-                                target_key = list(edit_action.keys())[0]
-                                if isinstance(edit_action[target_key], dict):
-                                    word_to_replace = str(edit_action[target_key].get('action'))
+                                target_key = list(edit_action.keys())[0]  # 'change' или 'delete'
+                                action_data = edit_action[target_key]
+
+                                if isinstance(action_data, dict):
+                                    if 'action' in action_data:
+                                        raw_word = str(action_data['action'])
+                                        if raw_word != '+':
+                                            word_to_replace = raw_word
+                                elif isinstance(action_data, str):
+                                    # Это спасет категорию delete (например, {'delete': 'cat'})
+                                    word_to_replace = action_data
+
                         except Exception as e:
                             print(f"  [Оркестратор] Не удалось распарсить edit_action: {e}")
 
@@ -84,21 +96,23 @@ class EvaluationPipeline:
                         "source_prompt": source_prompt,
                         "target_prompt": target_prompt,
                         "image_id": img_id,
-                        "word_to_replace": word_to_replace  # Сохраняем слово!
+                        "word_to_replace": word_to_replace
                     })
             except Exception as e:
                 print(f"  Ошибка при загрузке {subset_name}: {e}")
 
     def _sanitize_filename(self, name: str) -> str:
-        """Заменяет недопустимые символы на '_' для безопасного имени файла."""
         return re.sub(r'[^a-zA-Z0-9_\-]', '_', str(name))
 
     def run_evaluation(self, results_dir: str = "results", output_csv: str = "evaluation_results.csv") -> pd.DataFrame:
-        """Запускает процесс оценки: генерация, расчёт метрик, сохранение."""
+        """Запускает процесс оценки: генерация маски, инверсия, расчёт метрик, сохранение."""
         print("\n=== Запуск пайплайна оценки ===")
 
         os.makedirs(os.path.join(results_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(results_dir, "errors"), exist_ok=True)
+        # Опционально: сохраняем маски CLIPSeg, чтобы вы могли вставить их в диплом!
+        os.makedirs(os.path.join(results_dir, "clipseg_masks"), exist_ok=True)
+
         csv_path = os.path.join(results_dir, output_csv)
 
         processed_keys = set()
@@ -122,9 +136,18 @@ class EvaluationPipeline:
             target_prompt = item['target_prompt']
             category = item['category']
             img_id = item['image_id']
-
-            # Извлекаем наше слово из Ячейки 3
             word_to_replace = item.get('word_to_replace')
+
+            # --- ГЕНЕРИРУЕМ МАСКУ CLIPSeg ---
+            clipseg_mask = None
+            if word_to_replace and word_to_replace.lower() != "none":
+                try:
+                    clipseg_mask = self._get_clipseg_mask(image, word_to_replace)
+                    # Сохраним маску для наглядности (полезно для диплома)
+                    mask_path = os.path.join(results_dir, "clipseg_masks", f"mask_{img_id}_{word_to_replace}.png")
+                    clipseg_mask.save(mask_path)
+                except Exception as e:
+                    print(f"  [Внимание] Ошибка CLIPSeg для {word_to_replace}: {e}")
 
             for method_name, method_pipeline in self.methods.items():
                 run_key = f"{category}_{img_id}_{method_name}"
@@ -142,23 +165,17 @@ class EvaluationPipeline:
                     torch.cuda.empty_cache()
 
                 try:
-                    correct_token_index = -1
-                    if word_to_replace:
-                        correct_token_index = self._get_target_token_index(method_pipeline, source_prompt,
-                                                                           word_to_replace)
-                    elif item.get('token_index') is not None:  # Безопасный фолбэк
-                        correct_token_index = item['token_index']
-
-                    # === ИСПРАВЛЕНИЕ 2: Отладочный вывод ===
-                    print(f"\n  [DEBUG] Метод: {method_name} | Ищем: '{word_to_replace}' | Индекс: {correct_token_index}")
+                    print(
+                        f"\n  [DEBUG] Метод: {method_name} | Ищем: '{word_to_replace}' | Маска CLIPSeg: {'Да' if clipseg_mask else 'Нет'}")
 
                     with PerformanceMonitor() as monitor:
+                        # --- ПЕРЕДАЕМ ИЗОБРАЖЕНИЕ И МАСКУ ---
                         edited_image = method_pipeline.run(
                             image=image,
                             source_prompt=source_prompt,
                             target_prompt=target_prompt,
-                            token_index=correct_token_index,  # Передаем 100% точный индекс
-                            image_id=img_id  # Передаем ID для маски
+                            mask=clipseg_mask,  # <--- ВОТ НАША ИДЕАЛЬНАЯ МАСКА!
+                            image_id=img_id
                         )
 
                     if edited_image is None:
