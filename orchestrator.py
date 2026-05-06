@@ -5,6 +5,7 @@ import traceback
 import pandas as pd
 import torch
 import numpy as np
+from scipy import ndimage
 from tqdm.auto import tqdm
 from typing import Dict, Any, List
 from PIL import Image
@@ -19,7 +20,8 @@ from metrics.performance import PerformanceMonitor
 class EvaluationPipeline:
     """
     Оркестратор бенчмарка: загружает датасет PIE_Bench_pp, генерирует внешние маски (CLIPSeg),
-    прогоняет изображения через методы инверсии, собирает метрики и сохраняет результаты.
+    раздувает их (Dilation) для свободы геометрии, прогоняет изображения через методы инверсии,
+    собирает метрики и сохраняет результаты.
     """
 
     def __init__(self, methods_dict: Dict[str, Any], evaluator: Any, device: str = "cuda"):
@@ -38,7 +40,7 @@ class EvaluationPipeline:
         print("[Оркестратор] CLIPSeg готов!")
 
     def _get_clipseg_mask(self, image: Image.Image, text: str, threshold: float = 0.4) -> Image.Image:
-        """Внутренний метод генерации маски по слову с помощью CLIPSeg."""
+        """Внутренний метод генерации маски по слову с помощью CLIPSeg + Раздувание (Dilation)."""
         inputs = self.clipseg_processor(text=[text], images=[image], padding=True, return_tensors="pt").to(self.device)
 
         with torch.no_grad():
@@ -47,12 +49,17 @@ class EvaluationPipeline:
         # Преобразуем логиты в вероятности (Sigmoid)
         probs = torch.sigmoid(outputs.logits.squeeze()).cpu().numpy()
 
-        # Создаем бинарную маску
-        mask_np = (probs > threshold).astype(np.uint8) * 255
-        return Image.fromarray(mask_np, mode='L')
+        # 1. Создаем базовую бинарную маску (0 или 1)
+        base_mask = (probs > threshold).astype(np.uint8)
+
+        # 2. РАЗДУВАЕМ МАСКУ (Dilation) на 15 итераций
+        # Это создаст "буферную зону" вокруг объекта, чтобы новая геометрия могла выйти за старые края
+        dilated_mask = ndimage.binary_dilation(base_mask, iterations=15).astype(np.uint8) * 255
+
+        return Image.fromarray(dilated_mask, mode='L')
 
     def load_data(self, subsets: List[str], split: str = "V1"):
-        """Загружает указанные подмножества и парсит слова для редактирования."""
+        """Загружает указанные подмножества и умно парсит слова для редактирования."""
         self.dataset = []
         print(f"Загрузка данных из {self.hf_repo} (split='{split}')...")
 
@@ -73,9 +80,9 @@ class EvaluationPipeline:
                                 import ast
                                 edit_action = ast.literal_eval(edit_action)
 
-                            # --- ИСПРАВЛЕННЫЙ ПАРСЕР (Поддерживает и Change, и Delete) ---
+                            # --- УМНЫЙ ПАРСЕР (Поддерживает Change, Delete и нестандартные форматы) ---
                             if isinstance(edit_action, dict):
-                                target_key = list(edit_action.keys())[0]  # 'change' или 'delete'
+                                target_key = list(edit_action.keys())[0]  # 'change', 'delete', 'add'
                                 action_data = edit_action[target_key]
 
                                 if isinstance(action_data, dict):
@@ -84,7 +91,7 @@ class EvaluationPipeline:
                                         if raw_word != '+':
                                             word_to_replace = raw_word
                                 elif isinstance(action_data, str):
-                                    # Это спасет категорию delete (например, {'delete': 'cat'})
+                                    # Спасает простые строки типа {'delete': 'cat'} или {'change_background': 'in a park'}
                                     word_to_replace = action_data
 
                         except Exception as e:
@@ -110,7 +117,6 @@ class EvaluationPipeline:
 
         os.makedirs(os.path.join(results_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(results_dir, "errors"), exist_ok=True)
-        # Опционально: сохраняем маски CLIPSeg, чтобы вы могли вставить их в диплом!
         os.makedirs(os.path.join(results_dir, "clipseg_masks"), exist_ok=True)
 
         csv_path = os.path.join(results_dir, output_csv)
@@ -138,12 +144,12 @@ class EvaluationPipeline:
             img_id = item['image_id']
             word_to_replace = item.get('word_to_replace')
 
-            # --- ГЕНЕРИРУЕМ МАСКУ CLIPSeg ---
+            # --- ГЕНЕРИРУЕМ И РАЗДУВАЕМ МАСКУ CLIPSeg ---
             clipseg_mask = None
-            if word_to_replace and word_to_replace.lower() != "none":
+            if word_to_replace and str(word_to_replace).lower() not in ["none", "null"]:
                 try:
                     clipseg_mask = self._get_clipseg_mask(image, word_to_replace)
-                    # Сохраним маску для наглядности (полезно для диплома)
+                    # Сохраним маску для наглядности (чтобы видеть ту самую "буферную зону")
                     mask_path = os.path.join(results_dir, "clipseg_masks", f"mask_{img_id}_{word_to_replace}.png")
                     clipseg_mask.save(mask_path)
                 except Exception as e:
@@ -165,16 +171,15 @@ class EvaluationPipeline:
                     torch.cuda.empty_cache()
 
                 try:
-                    print(
-                        f"\n  [DEBUG] Метод: {method_name} | Ищем: '{word_to_replace}' | Маска CLIPSeg: {'Да' if clipseg_mask else 'Нет'}")
+                    print(f"\n  [DEBUG] Метод: {method_name} | Ищем: '{word_to_replace}' | Маска CLIPSeg: {'Да' if clipseg_mask else 'Нет'}")
 
                     with PerformanceMonitor() as monitor:
-                        # --- ПЕРЕДАЕМ ИЗОБРАЖЕНИЕ И МАСКУ ---
+                        # --- ПЕРЕДАЕМ ИЗОБРАЖЕНИЕ И РАЗДУТУЮ МАСКУ ---
                         edited_image = method_pipeline.run(
                             image=image,
                             source_prompt=source_prompt,
                             target_prompt=target_prompt,
-                            mask=clipseg_mask,  # <--- ВОТ НАША ИДЕАЛЬНАЯ МАСКА!
+                            mask=clipseg_mask,
                             image_id=img_id
                         )
 
