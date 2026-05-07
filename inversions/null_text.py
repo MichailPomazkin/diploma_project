@@ -1,6 +1,7 @@
 import torch
 import torchvision
 import os
+import math
 import torch.nn.functional as F
 from torch.optim import Adam
 from typing import Optional, Tuple, List
@@ -16,8 +17,9 @@ from .base_inverter import BaseInverter
 class NullTextInverter(BaseInverter):
     """
     Null-text Inversion с поддержкой внешней пространственной маски.
-    Реализует мягкое смешивание (soft blending), временное управление маской
-    и инъекцию чистого шума (Noise Erasure) для бесшовной интеграции объекта.
+    Реализует мягкое смешивание (soft blending), временное управление маской,
+    а также "Частичную амнезию" и страховку негативным промптом для баланса
+    между новой геометрией и правильной анатомией.
     """
 
     def __init__(self, pipeline: StableDiffusionXLPipeline):
@@ -26,8 +28,11 @@ class NullTextInverter(BaseInverter):
         self.forward_scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config)
 
         with torch.no_grad():
+            # --- ИДЕЯ 1: Чит-код (Негативный промпт вместо пустоты) ---
+            # Спасает собак и людей от превращения в мутантов
+            neg_prompt = "mutated, deformed, ugly, bad anatomy, bad proportions, extra limbs, disjointed, flat, duplicate"
             self.empty_embeds, _, self.empty_pooled, _ = self.pipeline.encode_prompt(
-                prompt="", device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
+                prompt=neg_prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False
             )
             self.empty_embeds = self.empty_embeds.to(self.device)
             self.empty_pooled = self.empty_pooled.to(self.device)
@@ -231,14 +236,19 @@ class NullTextInverter(BaseInverter):
                     blur = T.GaussianBlur(kernel_size=(5, 5), sigma=(2.0, 2.0))
                     soft_mask = blur(self.spatial_mask.float())
 
-                    # --- НОВИЗНА: Инъекция чистого шума (Амнезия старого объекта) ---
-                    print("  [Null-text] Стираем память о старом объекте чистым шумом...")
+                    # --- ИДЕЯ 2: Частичная Амнезия (Смешивание шумов) ---
+                    print("  [Null-text] Применяем Частичную Амнезию (50% скелета, 50% свободы)...")
                     pure_noise = torch.randn_like(latents)
                     mask_dt = soft_mask.to(device=self.device, dtype=latents.dtype)
-                    # Фон (где mask_dt=1) остается исходным, Объект (где mask_dt=0) заменяется на чистый шум
-                    latents = latents * mask_dt + pure_noise * (1.0 - mask_dt)
 
-                # --- НОВИЗНА: Шаг отключения маски снижен с 0.8 до 0.65 ---
+                    # Математически корректное смешивание с сохранением дисперсии
+                    noise_strength = 0.5
+                    mixed_noise = latents * math.sqrt(1.0 - noise_strength) + pure_noise * math.sqrt(noise_strength)
+
+                    # Фон (mask_dt=1) остается оригинальным, Объект (mask_dt=0) получает гибридный шум
+                    latents = latents * mask_dt + mixed_noise * (1.0 - mask_dt)
+
+                # --- ИДЕЯ 3: Идеальный баланс (Cutoff 0.65) ---
                 cutoff_step = int(num_steps * 0.65)
 
                 for i, t in enumerate(timesteps):
@@ -279,7 +289,7 @@ class NullTextInverter(BaseInverter):
                             latents = latents * (1.0 - mask_dt) + target_latent * mask_dt
                         elif i == cutoff_step:
                             print(
-                                "  [Null-text] Soft Blending: маска отключена на 65% шагов, полная свобода геометрии.")
+                                "  [Null-text] Soft Blending: маска отключена на 65% шагов, финальная сшивка.")
 
                 image = self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[
                     0]
