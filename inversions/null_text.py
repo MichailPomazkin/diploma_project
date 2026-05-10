@@ -231,10 +231,10 @@ class NullTextInverter(BaseInverter):
                 # ---- Подготовка мягкой маски (Gaussian Blur) ----
                 soft_mask = None
                 if hasattr(self, 'spatial_mask') and self.spatial_mask is not None:
-                    blur = T.GaussianBlur(kernel_size=(5, 5), sigma=(2.0, 2.0))
+                    blur = T.GaussianBlur(kernel_size=(3, 3), sigma=(0.5, 0.5))
                     soft_mask = blur(self.spatial_mask.float())
 
-                cutoff_step = int(num_steps * 1.0)
+                cutoff_step = int(num_steps * kwargs.get("cutoff_ratio", 0.7))
 
                 for i, t in enumerate(timesteps):
                     uncond_emb = context[i] if context else self.empty_embeds
