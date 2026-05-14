@@ -33,7 +33,7 @@ class EvaluationPipeline:
         self.results: List[Dict[str, Any]] = []
         self.dataset: List[Dict[str, Any]] = []
 
-        # --- ИНИЦИАЛИЗАЦИЯ CLIPSeg ---
+        # инициализация CLIPSeg
         print("[Оркестратор] Загрузка модели CLIPSeg для точной сегментации...")
         self.clipseg_processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         self.clipseg_model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(self.device)
@@ -52,8 +52,7 @@ class EvaluationPipeline:
         # 1. Создаем базовую бинарную маску (0 или 1)
         base_mask = (probs > threshold).astype(np.uint8)
 
-        # 2. РАЗДУВАЕМ МАСКУ (Dilation) на 15 итераций
-        # Это создаст "буферную зону" вокруг объекта, чтобы новая геометрия могла выйти за старые края
+        # 2. раздуваем маску на 15 итераций
         dilated_mask = ndimage.binary_dilation(base_mask, iterations=15).astype(np.uint8) * 255
 
         return Image.fromarray(dilated_mask, mode='L')
@@ -80,7 +79,7 @@ class EvaluationPipeline:
                                 import ast
                                 edit_action = ast.literal_eval(edit_action)
 
-                            # --- УМНЫЙ ПАРСЕР (Поддерживает Change, Delete и нестандартные форматы) ---
+                            # умный парсер
                             if isinstance(edit_action, dict):
                                 target_key = list(edit_action.keys())[0]  # 'change', 'delete', 'add'
                                 action_data = edit_action[target_key]
@@ -144,7 +143,7 @@ class EvaluationPipeline:
             img_id = item['image_id']
             word_to_replace = item.get('word_to_replace')
 
-            # --- ГЕНЕРИРУЕМ И РАЗДУВАЕМ МАСКУ CLIPSeg ---
+            # генерируем и раздуваем маску CLIPSeg
             clipseg_mask = None
             if word_to_replace and str(word_to_replace).lower() not in ["none", "null"]:
                 try:

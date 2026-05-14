@@ -95,7 +95,8 @@ class BaseInverter(ABC):
             prompt=target_prompt,
             context=context,
             num_steps=kwargs.get("num_steps", 50),
-            guidance_scale=kwargs.get("guidance_scale", 7.5)
+            guidance_scale=kwargs.get("guidance_scale", 7.5),
+            **kwargs.get("reconstruct_kwargs", {})
         )
 
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
