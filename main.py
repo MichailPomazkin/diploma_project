@@ -45,7 +45,7 @@ def parse_args():
         "--subsets",
         nargs="+",
         default=[
-            "1_change_object_80"  # Строго одна категория для честного теста геометрии
+            "1_change_object_80"
         ],
         help="Список категорий датасета PIE-Bench++ для тестирования."
     )
@@ -135,7 +135,7 @@ def main():
             base_null,
             use_spatial_mask=True,
             num_inner_steps=5,
-            reconstruct_kwargs={"cutoff_ratio": 0.55, "noise_strength": 0.5}
+            reconstruct_kwargs={"cutoff_ratio": 0.6, "noise_strength": 0.3}
         ),
 
         # --- Optimization-free Masked DDIM Inversion (Легкий метод) ---
@@ -143,7 +143,7 @@ def main():
             base_null,
             use_spatial_mask=True,
             num_inner_steps=0,
-            reconstruct_kwargs={"cutoff_ratio": 0.55, "noise_strength": 0.5}
+            reconstruct_kwargs={"cutoff_ratio": 0.6, "noise_strength": 0.3}
         ),
     }
 

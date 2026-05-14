@@ -52,8 +52,8 @@ class EvaluationPipeline:
         # 1. Создаем базовую бинарную маску (0 или 1)
         base_mask = (probs > threshold).astype(np.uint8)
 
-        # 2. раздуваем маску на 15 итераций
-        dilated_mask = ndimage.binary_dilation(base_mask, iterations=15).astype(np.uint8) * 255
+        # 2. раздуваем маску на 7 итераций
+        dilated_mask = ndimage.binary_dilation(base_mask, iterations=7).astype(np.uint8) * 255
 
         return Image.fromarray(dilated_mask, mode='L')
 
