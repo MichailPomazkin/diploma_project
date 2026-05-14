@@ -199,7 +199,7 @@ class NullTextInverter(BaseInverter):
             raise ValueError(f"len(context)={len(context)} != num_steps={num_steps}")
 
         noise_strength = kwargs.get("noise_strength", 0.5)
-        cutoff_ratio = kwargs.get("cutoff_ratio", 0.55)
+        cutoff_ratio = kwargs.get("cutoff_ratio", 1.00)
 
         print(f"[Null-text] Восстановление: noise={noise_strength}, cutoff={cutoff_ratio}")
 

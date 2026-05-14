@@ -135,7 +135,7 @@ def main():
             base_null,
             use_spatial_mask=True,
             num_inner_steps=5,
-            reconstruct_kwargs={"cutoff_ratio": 0.6, "noise_strength": 0.3}
+            reconstruct_kwargs={"cutoff_ratio": 0.5, "noise_strength": 1.0}
         ),
 
         # --- Optimization-free Masked DDIM Inversion (Легкий метод) ---
@@ -143,7 +143,7 @@ def main():
             base_null,
             use_spatial_mask=True,
             num_inner_steps=0,
-            reconstruct_kwargs={"cutoff_ratio": 0.6, "noise_strength": 0.3}
+            reconstruct_kwargs={"cutoff_ratio": 0.5, "noise_strength": 1.0}
         ),
     }
 
